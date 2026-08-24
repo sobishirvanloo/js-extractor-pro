@@ -1,0 +1,9 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+jsbeautifier>=1.15.0
+
+# Optional (needed only for --dynamic)
+# playwright>=1.40.0
+
+# Optional (needed only for source map recovery)
+# python-sourcemap>=0.5
