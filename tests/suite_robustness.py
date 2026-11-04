@@ -110,7 +110,7 @@ cli.sync_playwright, B = make_pw(launch_raises=RuntimeError("Executable doesn't 
 check(cli.extract_dynamic("https://t/", args) == ([], []), "dynamic: Chromium missing → no crash")
 
 # ── (c) param noise ──────────────────────────────────────────────────────────
-params = cli.extract_params("x = {toString: 1, forEach: 2, hasOwnProperty: 3, userId: 4, ToString: 5}")
+params = cli.extract_params('fetch("/api", {method: "POST", body: JSON.stringify({toString: 1, forEach: 2, hasOwnProperty: 3, userId: 4, ToString: 5})})')
 check("userId" in params and not {"toString", "forEach", "ToString"} & set(params), f"params: mixed-case noise filtered ({params})")
 
 # ── (d) + (e): full run against a local server ───────────────────────────────
@@ -122,7 +122,7 @@ src_ts = 'const unused = 0;\nconst AWS = "AKIAEXTERNALFILE0001";\nconst pwd = { 
 routes = {
     "/": ("<html><script>navigator.serviceWorker.register('/sw.js');</script>"
           "<script type='module'>import { a } from './mod.js';</script>"
-          "<script>var x = 1;\nvar y = 2;\nvar inl = { api_key: 'INLINEKEY0123456789' };</script>"
+          "<script>var x = 1;\nvar y = 2;\nvar inl = { api_key: 'INLK8f3Qz71pXa29Lm' };</script>"
           "<script src='/app.js'></script></html>"),
     "/app.js": app_js,
     "/app.js.map": json.dumps({"version": 3, "names": [], "mappings": "AAAA",
@@ -161,7 +161,7 @@ aws = by_val.get("AKIAEXTERNALFILE0001")
 check(aws and {l["file"].split("/")[0] for l in aws["locations"]} == {"external", "sourcemap_recovered"},
       "secrets: same key in bundle + recovered source grouped into one finding with 2 locations")
 check(JWT1 in by_val and JWT2 in by_val, "secrets: distinct JWTs with same header no longer collapsed")
-check("INLINEKEY0123456789" in by_val and by_val["INLINEKEY0123456789"]["file"].startswith("inline/"),
+check("INLK8f3Qz71pXa29Lm" in by_val and by_val["INLK8f3Qz71pXa29Lm"]["file"].startswith("inline/"),
       "secrets: inline finding attributed to inline/ file")
 check("hunter2x" in by_val and by_val["hunter2x"]["file"].endswith("keys.ts"), "secrets: recovered source attributed to its file")
 
@@ -169,7 +169,7 @@ report = (OUT / "report.html").read_text()
 check("AKIAEXTERNALFILE0001" not in report and "hunter2x" not in report and JWT1 not in report,
       "report: secret values masked")
 check("keys.ts:3" in report and "external/" in report, "report: shows file:line locations")
-for v in ("hunter2x", "INLINEKEY0123456789", JWT1):
+for v in ("hunter2x", "INLK8f3Qz71pXa29Lm", JWT1):
     m = cli.mask_secret(v)
     check(len(m.replace("...", "")) <= len(v) // 2, f"mask_secret reveals at most half: {m!r}")
 

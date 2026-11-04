@@ -67,6 +67,7 @@ import bisect
 import contextlib
 import fnmatch
 import ipaddress
+import math
 import hashlib
 import json
 import re
@@ -1418,136 +1419,325 @@ def detect_frameworks(all_js: str) -> list[str]:
 # Analysis: endpoint extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Patterns ordered from most specific to most general
-_ENDPOINT_PATTERNS = [
-    # fetch/axios/http explicit calls
-    r'''(?:fetch|axios\.(?:get|post|put|patch|delete|request))\s*\(\s*[`'"]((?:https?://[^`'"]{3,}|/[^`'"]{2,}))[`'"]''',
-    # url/path/endpoint/href assignments
-    r'''(?:url|path|endpoint|baseURL|baseUrl|apiUrl|href)\s*[:=]\s*[`'"]((?:https?://[^`'"]{4,}|/[^`'"]{2,}))[`'"]''',
-    # string literals that look like API paths
-    r'''[`'"]((?:/api|/v\d+|/graphql|/rest|/rpc|/internal|/admin|/auth|/oauth|/ws)[^`'"\s<>{}]{1,120})[`'"]''',
-    # template literals with path prefix
-    r'''`((?:/api|/v\d+|/internal|/admin)[^`]{1,120})`''',
+_HTTP_METHODS = "GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS"
+_EP_URL = r'''(?:https?://[^`'"\s]{3,300}|/[^`'"\s]{1,300})'''   # absolute URL or root-relative path
+
+# (regex, how the HTTP method is known). Group "url" = endpoint, "m" = method if inline.
+_ENDPOINT_RULES = [
+    # fetch("/x", { method: "POST" })   — method from the options argument, GET by default
+    (re.compile(r'''(?<![\w$.])fetch\s*\(\s*([`'"])(?P<url>''' + _EP_URL + r''')\1'''), "fetch"),
+    # axios.post("/x") · api.get(...) · this.http.delete(...) · $.post(...) · superagent.put(...)
+    (re.compile(r'''(?<![\w$])[\w$.]{1,60}\.(?P<m>get|post|put|patch|delete|head|options)\s*\(\s*([`'"])(?P<url>'''
+                + _EP_URL + r''')\2''', re.I), "inline"),
+    # xhr.open("POST", "/x")
+    (re.compile(r'''\.open\s*\(\s*["'`](?P<m>''' + _HTTP_METHODS + r''')["'`]\s*,\s*([`'"])(?P<url>'''
+                + _EP_URL + r''')\2''', re.I), "inline"),
+    # { url: "/x", method/type: "POST" } (axios config, $.ajax), url/path/endpoint/baseURL assignments
+    (re.compile(r'''(?<![\w$])(?:url|uri|path|endpoint|baseURL|baseUrl|apiUrl|api_url|href|action)["']?\s*[:=]\s*([`'"])(?P<url>'''
+                + _EP_URL + r''')\1'''), "object"),
+    # bare string literals that look like API paths
+    (re.compile(r'''[`'"](?P<url>(?:/api|/v\d+|/graphql|/gql|/rest|/rpc|/internal|/admin|/auth|/oauth|/ws)'''
+                r'''[^`'"\s<>{}]{1,200})[`'"]'''), None),
+    # template literals with a path prefix: `/api/users/${id}`
+    (re.compile(r'''`(?P<url>(?:/api|/v\d+|/internal|/admin)[^`]{1,200})`'''), None),
 ]
+MAX_OPTION_PARSES = 2000          # per file: fetch(url, {options}) parses / request objects
+_METHOD_IN_OBJ_RE = re.compile(r'''(?<![\w$])(?:method|type)\s*:\s*["'`](''' + _HTTP_METHODS + r''')["'`]''', re.I)
 
-# Paths that look like sensitive/hidden endpoints
-_HIDDEN_MARKERS = re.compile(
-    r'(?:internal|debug|admin|secret|hidden|private|test|dev|staging|backdoor|console|panel)',
-    re.IGNORECASE,
-)
+# Whole path tokens (split on / . _ - ? = & and camelCase) that mark sensitive endpoints.
+# Token matching avoids the old substring false positives: latest, device, contest, protest...
+_HIDDEN_TOKENS = {
+    "internal", "debug", "admin", "administrator", "admins", "secret", "secrets", "hidden",
+    "private", "test", "tests", "testing", "dev", "devel", "development", "staging", "stage",
+    "backdoor", "console", "panel", "actuator", "metrics", "swagger", "backup", "backups",
+    "config", "configuration", "env", "phpinfo", "trace", "manage", "management", "mgmt",
+    "superuser", "sudo", "root", "beta", "qa", "sandbox", "impersonate", "export", "dump",
+}
 
-_SKIP_EXTENSIONS = re.compile(r'\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|ico|map)(\?.*)?$', re.IGNORECASE)
+_SKIP_EXTENSIONS = re.compile(r'\.(js|mjs|css|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|otf|ico|map|mp4|webm|mp3)(\?.*)?$', re.I)
+
+
+def _path_tokens(path: str) -> set:
+    path = re.split(r"[?#]", path)[0]
+    words = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+", path)   # splits camelCase too
+    return {w.lower() for w in words}
+
+
+def is_hidden_endpoint(path: str) -> bool:
+    return bool(_path_tokens(path) & _HIDDEN_TOKENS)
+
+
+def _clean_endpoint(url: str):
+    """Normalise ${expr} to {param}; drop static assets, prose and junk."""
+    ep = re.sub(r"\$\{[^}]{0,200}\}", "{param}", url.strip())
+    if len(ep) < 2 or ep in ("//",) or re.search(r"\s", ep) or _SKIP_EXTENSIONS.search(ep):
+        return None
+    if ep.startswith("//"):                      # protocol-relative: not a path
+        return None
+    return ep
+
+
+def find_endpoints(js_code: str) -> list[dict]:
+    """Endpoints in one file: [{path, method or None, line}]."""
+    newlines = [i for i, ch in enumerate(js_code) if ch == "\n"]
+    found = []
+    option_parses = 0
+    for rx, how in _ENDPOINT_RULES:
+        for m in rx.finditer(js_code):
+            ep = _clean_endpoint(m.group("url"))
+            if not ep:
+                continue
+            method = None
+            if how == "inline":
+                method = m.group("m").upper()
+            elif how == "fetch" and option_parses < MAX_OPTION_PARSES:
+                # Bounded: hostile input with 100k+ fetch( calls stays linear
+                option_parses += 1
+                args = _call_args(js_code, js_code.index("(", m.start()) + 1, 600)
+                mm = _METHOD_IN_OBJ_RE.search(args[1]) if len(args) > 1 else None
+                method = mm.group(1).upper() if mm else "GET"
+            elif how == "object":
+                # method/type key in the same object literal (a few hundred chars around)
+                around = js_code[max(0, m.start() - 300): m.end() + 300]
+                mm = _METHOD_IN_OBJ_RE.search(around)
+                method = mm.group(1).upper() if mm else None
+            found.append({"path": ep, "method": method,
+                          "line": bisect.bisect_left(newlines, m.start()) + 1})
+    return found
+
+
+def find_endpoints_in_files(files: list[tuple[str, str, int]]) -> list[dict]:
+    """
+    Endpoints across files, grouped by path:
+      {path, methods: [...], hidden: bool, file, line, locations: [{file, line}]}
+    """
+    grouped = {}
+    for path, text, offset in files:
+        for f in find_endpoints(text):
+            loc = {"file": path, "line": f["line"] + offset}
+            g = grouped.setdefault(f["path"], {"path": f["path"], "methods": set(),
+                                               "hidden": is_hidden_endpoint(f["path"]), **loc, "locations": []})
+            if f["method"]:
+                g["methods"].add(f["method"])
+            if loc not in g["locations"]:
+                g["locations"].append(loc)
+    out = []
+    for g in grouped.values():
+        g["methods"] = sorted(g["methods"])
+        out.append(g)
+    return sorted(out, key=lambda g: g["path"])
 
 
 def extract_endpoints(js_code: str) -> tuple[list[str], list[str]]:
-    """
-    Extract API endpoint strings from JavaScript source.
-
-    Returns:
-      endpoints : list[str]  -- all found endpoints
-      hidden    : list[str]  -- subset that look sensitive/internal
-    """
-    found = set()
-    for pat in _ENDPOINT_PATTERNS:
-        for m in re.finditer(pat, js_code, re.MULTILINE | re.IGNORECASE):
-            ep = m.group(1).strip()
-            # Filter noise
-            if len(ep) < 2:
-                continue
-            if _SKIP_EXTENSIONS.search(ep):
-                continue
-            # Remove template-literal expressions like ${id}
-            ep_clean = re.sub(r'\$\{[^}]+\}', '{param}', ep)
-            found.add(ep_clean)
-
-    endpoints = sorted(found)
-    hidden = [e for e in endpoints if _HIDDEN_MARKERS.search(e)]
-    return endpoints, hidden
+    """Back-compat wrapper: (all endpoint paths, hidden subset) for one blob of JS."""
+    details = find_endpoints_in_files([("", js_code, 0)])
+    return [d["path"] for d in details], [d["path"] for d in details if d["hidden"]]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Analysis: parameter extraction
 # ══════════════════════════════════════════════════════════════════════════════
 
-_PARAM_PATTERNS = [
-    # Query string params: ?foo=  &bar=
-    r'[?&]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})=',
-    # Object key patterns in request bodies: { userId: ..., limit: ... }
-    r'''[{,]\s*['"]?([a-zA-Z_][a-zA-Z0-9_\-]{1,40})['"]?\s*:''',
-    # URLSearchParams / FormData .append / .set / .get calls
-    r'''(?:\.append|\.set|\.get|\.has)\s*\(\s*['"]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})['"]''',
-    # express-style route params: /users/:id, /orders/:orderId
-    r'''['"`]/[^'"`\s]*/:([a-zA-Z_][a-zA-Z0-9_\-]{1,40})''',
-    # input name= attributes inside template strings / HTML in JS
-    r'''name\s*=\s*['"]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})['"]''',
-    # HTML form fields in string literals
-    r'''<input[^>]+name\s*=\s*['"]([a-zA-Z_][a-zA-Z0-9_\-]{1,40})['"]''',
+# Only names that actually reach a request. The old "every {key:" pattern
+# turned the wordlist into thousands of React/webpack internals.
+_PNAME = r'''[A-Za-z_$][\w$\-\[\].]{0,40}'''
+_PARAM_RES = [
+    # query strings: ?foo=  &bar=
+    re.compile(r'''[?&](''' + _PNAME + r''')='''),
+    # URLSearchParams / FormData style access on param-ish receivers
+    re.compile(r'''(?<![\w$])(?:searchParams|urlParams|params|query|qs|formData|fd|form|payload)\s*\.\s*'''
+               r'''(?:get|getAll|has|set|append|delete)\s*\(\s*["'`](''' + _PNAME + r''')["'`]'''),
+    # new URLSearchParams(location.search).get("redirect")
+    re.compile(r'''URLSearchParams\s*\([^()]{0,200}\)\s*\.\s*(?:get|getAll|has)\s*\(\s*["'`](''' + _PNAME + r''')["'`]'''),
+    # FormData / URLSearchParams .append/.set("name", value) — two-argument form
+    re.compile(r'''\.(?:append|set)\s*\(\s*["'`](''' + _PNAME + r''')["'`]\s*,'''),
+    # route params inside path strings: /users/:id
+    re.compile(r'''/:([A-Za-z_]\w{0,40})(?=[/"'`?)]|$)'''),
+    # GraphQL operation variables: query($id: ID!, $first: Int)
+    re.compile(r'''\$([A-Za-z_]\w{0,40})\s*:\s*\[?\s*[A-Z]\w*'''),
+    # form fields in HTML or HTML-in-JS
+    re.compile(r'''<(?:input|select|textarea|button)\b[^>]{0,300}?\bname\s*=\s*\\?["']([^"'\\\s]{1,40})''', re.I),
 ]
+# Where an object literal is a request payload: its top-level keys are params
+_PARAM_OBJ_RES = [
+    re.compile(r'''(?<![\w$])(?:params|data|body|json|query|variables|searchParams|qs|form|payload)\s*:\s*(?=\{)'''),
+    re.compile(r'''(?:JSON\.stringify|(?<![\w$])stringify|URLSearchParams)\s*\(\s*(?=\{)'''),
+    re.compile(r'''\.(?:post|put|patch)\s*\(\s*[^,()]{1,300},\s*(?=\{)'''),
+]
+# Language noise only — real field names like name/type/data/value are kept now
+_PARAM_NOISE = {w.lower() for w in (
+    "function", "return", "const", "let", "var", "class", "import", "export", "default",
+    "true", "false", "null", "undefined", "this", "new", "typeof", "prototype",
+    "constructor", "toString", "valueOf", "hasOwnProperty", "length", "__proto__",
+    # built-in method names: never real request fields
+    "forEach", "map", "filter", "reduce", "push", "pop", "then", "catch", "apply", "call", "bind",
+)}
+# Header names passed to Headers.append/set are not fuzzable params
+_HEADER_NAME_RE = re.compile(r"^(?:[A-Z][a-z0-9]*(?:-[A-Z][a-z0-9]*)+|[Xx]-[\w-]+|content-type|authorization|accept)$")
 
-# Noise words to exclude from param results
-_PARAM_NOISE = {
-    "function", "return", "const", "let", "var", "class", "import", "export",
-    "default", "true", "false", "null", "undefined", "this", "new", "typeof",
-    "if", "else", "for", "while", "do", "switch", "case", "break", "continue",
-    "try", "catch", "throw", "async", "await", "yield", "of", "in",
-    "prototype", "constructor", "toString", "length", "push", "pop", "map",
-    "filter", "reduce", "forEach", "find", "some", "every", "then", "catch",
-    "resolve", "reject", "data", "error", "event", "result", "response",
-    "request", "options", "config", "params", "props", "state", "value",
-    "type", "name", "text", "html", "body", "head", "style", "src", "href",
-}
-# Matching is case-insensitive, so normalise once (mixed-case entries like
-# "toString" / "forEach" never matched before).
-_PARAM_NOISE = {w.lower() for w in _PARAM_NOISE}
+
+def _object_keys(obj: str) -> list[str]:
+    """Top-level keys of a JS object literal "{a: 1, 'b': 2, c, ...d}"."""
+    inner = obj.strip()
+    if not (inner.startswith("{") and inner.endswith("}")):
+        return []
+    keys = []
+    for part in _split_top_level(inner[1:-1], ","):
+        part = part.strip()
+        if not part or part.startswith("..."):
+            continue
+        key = _split_top_level(part, ":")[0].strip()
+        key = key.strip("\"'`")
+        if re.fullmatch(_PNAME, key) and not key.startswith("["):
+            keys.append(key)
+    return keys
+
 
 def extract_params(js_code: str, html_code: str = "") -> list[str]:
     """
-    Extract parameter names from JS (and optionally HTML) for use in fuzzing.
+    Extract request parameter names from JS (and optionally HTML) for fuzzing.
     Returns a deduplicated, sorted list.
     """
-    combined = js_code + "\n" + html_code
     found = set()
+    for text in (js_code, html_code):
+        if not text:
+            continue
+        for rx in _PARAM_RES:
+            for m in rx.finditer(text):
+                found.add(m.group(1).strip())
+        for i, m in enumerate(rx_m for rx in _PARAM_OBJ_RES for rx_m in rx.finditer(text)):
+            if i >= MAX_OPTION_PARSES:
+                break
+            found.update(_object_keys(_scan_js_expr(text, m.end(), 3000)))
 
-    for pat in _PARAM_PATTERNS:
-        for m in re.finditer(pat, combined, re.MULTILINE | re.IGNORECASE):
-            p = m.group(1).strip()
-            if p.lower() not in _PARAM_NOISE and 2 <= len(p) <= 40:
-                found.add(p)
-
-    return sorted(found, key=str.lower)
+    return sorted((p for p in found
+                   if 1 <= len(p) <= 40 and p.lower() not in _PARAM_NOISE and not _HEADER_NAME_RE.match(p)),
+                  key=str.lower)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Analysis: secret / credential detection
 # ══════════════════════════════════════════════════════════════════════════════
 
-_SECRET_PATTERNS = [
-    # Generic key/secret assignments
-    (r'''(?:api[_-]?key|apikey|api_secret)\s*[:=]\s*['"`]([A-Za-z0-9_\-]{16,})['"`]''', "API Key"),
-    (r'''(?:secret|client_secret|app_secret)\s*[:=]\s*['"`]([^'"`\s]{8,})['"`]''', "Secret"),
-    (r'''(?:password|passwd|pwd)\s*[:=]\s*['"`]([^'"`\s]{6,})['"`]''', "Password"),
-    # Specific service formats
-    (r'(sk-[a-zA-Z0-9]{20,})', "OpenAI SK Key"),
-    (r'(sk-proj-[a-zA-Z0-9_\-]{20,})', "OpenAI Project Key"),
-    (r'(AIza[A-Za-z0-9_\-]{35})', "Google API Key"),
-    (r'(AKIA[A-Z0-9]{16})', "AWS Access Key"),
-    (r'(gh[pousr]_[A-Za-z0-9_]{36,})', "GitHub Token"),
-    (r'(glpat-[A-Za-z0-9\-_]{20,})', "GitLab Token"),
-    (r'(xox[baprs]-[A-Za-z0-9\-]+)', "Slack Token"),
-    (r'(EAA[A-Za-z0-9]{50,})', "Facebook Token"),
-    # JWT
-    (r'(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})', "JWT Token"),
-    # Private keys
-    (r'(-----BEGIN (?:RSA |EC |DSA )?PRIVATE KEY-----)', "Private Key Block"),
-    # Hex secrets (32+ hex chars after key indicator)
-    (r'''(?:secret|token|key)\s*[:=]\s*['"`]([0-9a-fA-F]{32,})['"`]''', "Hex Secret"),
+# (label, regex with the secret in group 1, severity, generic)
+#   severity: high = credential that grants access; medium = needs review;
+#             low = public by design (publishable/browser keys) — still worth
+#             checking their restrictions, but not a leak on their own.
+#   generic:  context-based pattern → entropy + placeholder filtering applies.
+# Token formats are matched case-SENSITIVELY with word boundaries (the old
+# blanket IGNORECASE made `AKIA[A-Z0-9]{16}` match lowercase base64 noise).
+_SECRET_RULES = [
+    ("AWS Access Key ID", r'''(?<![A-Za-z0-9])((?:AKIA|ASIA)[A-Z0-9]{16})(?![A-Za-z0-9])''', "high", False),
+    ("AWS Secret Access Key", r'''(?i:aws[\w.-]{0,20}?(?:secret|sk)[\w]*)["']?\s*[:=]\s*["'`]([A-Za-z0-9/+=]{40})["'`]''', "high", False),
+    ("GitHub Token", r'''(?<![\w])(gh[pousr]_[A-Za-z0-9]{36,255})''', "high", False),
+    ("GitHub Fine-grained Token", r'''(?<![\w])(github_pat_[A-Za-z0-9_]{70,})''', "high", False),
+    ("GitLab Token", r'''(?<![\w-])(glpat-[A-Za-z0-9_-]{20,})''', "high", False),
+    ("Slack Token", r'''(?<![\w-])(xox[baprs]-[A-Za-z0-9-]{10,})''', "high", False),
+    ("Slack Webhook", r'''(https://hooks\.slack\.com/services/T[A-Za-z0-9_]+/B[A-Za-z0-9_]+/[A-Za-z0-9_]+)''', "high", False),
+    ("Discord Webhook", r'''(https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+)''', "high", False),
+    ("OpenAI API Key", r'''(?<![\w-])(sk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,}|sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}|sk-[A-Za-z0-9]{48})(?![\w-])''', "high", False),
+    ("Anthropic API Key", r'''(?<![\w-])(sk-ant-(?:api|admin)\d{2}-[A-Za-z0-9_-]{80,})''', "high", False),
+    ("Stripe Secret Key", r'''(?<![\w])((?:sk|rk)_live_[A-Za-z0-9]{20,})''', "high", False),
+    ("Stripe Test Secret Key", r'''(?<![\w])((?:sk|rk)_test_[A-Za-z0-9]{20,})''', "medium", False),
+    ("Stripe Publishable Key", r'''(?<![\w])(pk_(?:live|test)_[A-Za-z0-9]{20,})''', "low", False),
+    ("Twilio API Key", r'''(?<![A-Za-z0-9])(SK[0-9a-f]{32})(?![0-9a-f])''', "high", False),
+    ("Twilio Account SID", r'''(?<![A-Za-z0-9])(AC[0-9a-f]{32})(?![0-9a-f])''', "low", False),
+    ("SendGrid API Key", r'''(?<![\w])(SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43})''', "high", False),
+    ("Mailgun API Key", r'''(?<![\w-])(key-(?=[0-9a-z]{0,31}\d)[0-9a-z]{32})(?![0-9a-z])''', "high", False),
+    ("Mailchimp API Key", r'''(?<![0-9a-f])([0-9a-f]{32}-us\d{1,2})(?!\d)''', "high", False),
+    ("npm Token", r'''(?<![\w])(npm_[A-Za-z0-9]{36})(?![A-Za-z0-9])''', "high", False),
+    ("PyPI Token", r'''(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,})''', "high", False),
+    ("Shopify Token", r'''(?<![\w])(shp(?:at|ca|pa|ss)_[a-fA-F0-9]{32})''', "high", False),
+    ("Telegram Bot Token", r'''(?<![\d])(\d{8,10}:AA[A-Za-z0-9_-]{33})(?![\w-])''', "high", False),
+    ("Square Token", r'''(?<![\w-])(sq0(?:atp|csp)-[A-Za-z0-9_-]{22,43})''', "high", False),
+    ("Facebook Access Token", r'''(?<![A-Za-z0-9])(EAA[A-Za-z0-9]{80,})''', "high", False),
+    ("Azure Storage Connection String", r'''(DefaultEndpointsProtocol=https?;AccountName=[^;"'\s]+;AccountKey=[A-Za-z0-9+/=]{40,})''', "high", False),
+    ("Private Key", r'''(-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----)''', "high", False),
+    ("Mapbox Secret Token", r'''(?<![\w])(sk\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})''', "high", False),
+    ("Credentials in URL", r'''(?<![\w+.-])([a-z][a-z0-9+.-]{1,20}://[^\s/:@"'`<>]{1,64}:[^\s/@"'`<>]{1,128}@[A-Za-z0-9.-]+\.[A-Za-z]{2,})''', "high", True),
+    ("JWT", r'''(?<![\w-])(eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})''', "medium", False),
+    ("Mapbox Public Token", r'''(?<![\w])(pk\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})''', "low", False),
+    ("Google API Key", r'''(?<![\w-])(AIza[A-Za-z0-9_-]{35})(?![\w-])''', "low", False),
+    ("Sentry DSN", r'''(https://[0-9a-f]{32}@[\w.-]*sentry\.io/\d+)''', "low", False),
+    ("Firebase Database URL", r'''(https://[a-z0-9-]+\.firebaseio\.com)''', "low", False),
+    # generic, context-based → entropy + placeholder filtered
+    ("API Key", r'''(?i:api[_-]?key|apikey|x-api-key|api[_-]?secret|access[_-]?key)["']?\s*[:=]\s*["'`]([A-Za-z0-9_\-]{16,128})["'`]''', "medium", True),
+    ("Secret", r'''(?i:secret|client[_-]?secret|app[_-]?secret)["']?\s*[:=]\s*["'`]([^"'`\s]{8,128})["'`]''', "medium", True),
+    ("Password", r'''(?i:password|passwd|pwd)["']?\s*[:=]\s*["'`]([^"'`\s]{6,128})["'`]''', "medium", True),
+    ("Bearer Token", r'''["'`]Bearer\s+([A-Za-z0-9\-_.=~+/]{20,})["'`]''', "medium", True),
+    ("Hex Secret", r'''(?i:secret|token|key)["']?\s*[:=]\s*["'`]([0-9a-fA-F]{32,})["'`]''', "medium", True),
 ]
+_SECRET_RES = [(label, re.compile(rx), sev, generic) for label, rx, sev, generic in _SECRET_RULES]
+_SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+_LOW_NOTES = {
+    "Google API Key": "usually a browser key (Firebase/Maps) — check its API & referrer restrictions",
+    "Stripe Publishable Key": "publishable by design",
+    "Mapbox Public Token": "public by design — check its URL restrictions",
+    "Sentry DSN": "public by design; allows sending events to the project",
+    "Firebase Database URL": "check the database rules: try <url>/.json",
+    "Twilio Account SID": "an identifier, not a secret on its own — look for the auth token nearby",
+}
+
+_PLACEHOLDER_RE = re.compile(
+    r"(?i)your|example|sample|dummy|placeholder|changeme|change_me|redacted|insert|replace|"
+    r"xxxx|\*{3,}|<[^>]*>|\$\{|\{\{|process\.env|todo|fixme|lorem|abcdef|123456|qwerty")
+_PLACEHOLDER_WORDS = {"password", "passwd", "secret", "token", "apikey", "api_key", "null",
+                      "undefined", "true", "false", "none", "pass", "user", "username", "admin123"}
+
+
+def _shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    counts = defaultdict(int)
+    for ch in s:
+        counts[ch] += 1
+    return -sum(c / len(s) * math.log2(c / len(s)) for c in counts.values())
+
+
+def _looks_placeholder(v: str) -> bool:
+    low = v.lower()
+    return bool(
+        _PLACEHOLDER_RE.search(v)
+        or low in _PLACEHOLDER_WORDS
+        or len(set(low)) <= 3                                   # aaaaaaaa, 00000000
+        or (re.fullmatch(r"[A-Z0-9_]+", v) and "_" in v)        # ENV_VAR_NAME
+        or re.fullmatch(r"[A-Za-z]+(?:[._-][A-Za-z]+)+", v)     # i18n keys / field names: auth.password, new-password
+    )
+
+
+def _generic_secret_ok(label: str, v: str) -> bool:
+    """Filters for context-based patterns, where the value could be anything."""
+    if label == "Credentials in URL":
+        m = re.match(r"[^:]+://([^:]*):([^@]*)@([^/]+)", v)
+        if not m:
+            return False
+        user, pw, host = m.groups()
+        return not (_looks_placeholder(pw) or pw.lower() in {"pass", "password", "pwd", "secret"}
+                    or re.search(r"(?i)example\.(?:com|org|net)$", host))
+    if _looks_placeholder(v):
+        return False
+    if label == "Password":
+        return True                     # real passwords are low-entropy; placeholder filter only
+    # random keys: some entropy and both letters and digits
+    return (_shannon_entropy(v) >= 3.0 and re.search(r"\d", v) is not None
+            and re.search(r"[A-Za-z]", v) is not None)
+
+
+def _jwt_claims(token: str):
+    try:
+        payload = token.split(".")[1]
+        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return data if isinstance(data, dict) else None
+    except (ValueError, IndexError):
+        return None
+
 
 def find_secrets(js_code: str) -> list[dict]:
     """
     Scan JS source for leaked credentials/tokens.
 
-    Returns list of { type, value, line } dicts (line is 1-based within js_code).
+    Returns [{type, value, line, severity, note?, jwt?}] (line is 1-based within js_code).
     """
     # Offsets of every newline, so each match's line is a binary search
     # instead of re-counting the whole prefix (quadratic on big bundles).
@@ -1555,17 +1745,35 @@ def find_secrets(js_code: str) -> list[dict]:
     results = []
     seen = set()
 
-    for pat, label in _SECRET_PATTERNS:
-        for m in re.finditer(pat, js_code, re.IGNORECASE | re.MULTILINE):
+    for label, rx, severity, generic in _SECRET_RES:
+        for m in rx.finditer(js_code):
             val = m.group(1)
             # Dedupe on the full value: a 30-char prefix collapsed distinct
             # JWTs, which all share the same encoded header.
-            key = (label, val)
-            if key in seen:
+            # Rules run specific → generic, so a value already claimed by a
+            # specific rule (or an earlier generic one) isn't reported twice.
+            if val in seen or (generic and not _generic_secret_ok(label, val)):
                 continue
-            seen.add(key)
-            line_no = bisect.bisect_left(newlines, m.start()) + 1
-            results.append({"type": label, "value": val, "line": line_no})
+            seen.add(val)
+            finding = {"type": label, "value": val, "severity": severity,
+                       "line": bisect.bisect_left(newlines, m.start()) + 1}
+            if label in _LOW_NOTES:
+                finding["note"] = _LOW_NOTES[label]
+            if label == "JWT":
+                claims = _jwt_claims(val)
+                if claims is not None:
+                    finding["jwt"] = {k: claims[k] for k in ("iss", "role", "sub", "aud", "exp") if k in claims}
+                    role = str(claims.get("role", "")).lower()
+                    if role in ("service_role", "supabase_admin", "admin"):
+                        finding["severity"] = "high"
+                        finding["note"] = f"privileged role '{role}' (e.g. Supabase service key bypasses RLS)"
+                    elif role == "anon":
+                        finding["severity"] = "low"
+                        finding["note"] = "anonymous role — public by design (e.g. Supabase anon key)"
+                    exp = claims.get("exp")
+                    if isinstance(exp, (int, float)) and exp < time.time():
+                        finding["note"] = (finding.get("note", "") + "; expired").lstrip("; ")
+            results.append(finding)
 
     return results
 
@@ -1587,9 +1795,9 @@ def find_secrets_in_files(files: list[tuple[str, str, int]]) -> list[dict]:
             loc = {"file": path, "line": f["line"] + offset}
             key = (f["type"], f["value"])
             if key not in grouped:
-                grouped[key] = {"type": f["type"], "value": f["value"], **loc, "locations": []}
+                grouped[key] = {**{k: v for k, v in f.items() if k != "line"}, **loc, "locations": []}
             grouped[key]["locations"].append(loc)
-    return list(grouped.values())
+    return sorted(grouped.values(), key=lambda s: (_SEVERITY_ORDER[s["severity"]], s["file"], s["line"]))
 
 
 def mask_secret(val: str) -> str:
@@ -2241,10 +2449,16 @@ def generate_report(data: dict, out_dir: Path) -> Path:
 
     # ── Endpoints ────────────────────────────────────────────────────────────
     ep_rows = ""
-    for ep in data.get("endpoints", []):
-        is_hidden = ep in data.get("hidden_endpoints", [])
-        flag = f' {badge("HIDDEN", "#dc2626")}' if is_hidden else ""
-        ep_rows += f"<tr><td style='padding:5px;font-family:monospace;word-break:break-all'>{e(ep)}{flag}</td></tr>\n"
+    details = data.get("endpoint_details") or [
+        {"path": p, "methods": [], "hidden": p in data.get("hidden_endpoints", []), "file": "", "line": ""}
+        for p in data.get("endpoints", [])]
+    for d in details:
+        flag = f' {badge("HIDDEN", "#dc2626")}' if d["hidden"] else ""
+        methods = " ".join(badge(m, "#0f766e") for m in d["methods"])
+        where = f"{e(d['file'])}:{e(d['line'])}" if d.get("file") else ""
+        ep_rows += (f"<tr><td style='padding:5px;white-space:nowrap'>{methods}</td>"
+                    f"<td style='padding:5px;font-family:monospace;word-break:break-all'>{e(d['path'])}{flag}</td>"
+                    f"<td style='padding:5px;font-family:monospace;font-size:11px;color:#64748b;word-break:break-all'>{where}</td></tr>\n")
     ep_html = f"<table style='width:100%;border-collapse:collapse'>{ep_rows}</table>" if ep_rows else "<i>No endpoints extracted (use --endpoints)</i>"
 
     # ── Params ───────────────────────────────────────────────────────────────
@@ -2267,7 +2481,10 @@ def generate_report(data: dict, out_dir: Path) -> Path:
             loc_html += f"<br><i>+{len(locs) - 5} more (see secrets.json)</i>"
         sec_rows += (
             f"<tr>"
-            f"<td style='padding:5px'>{badge(s['type'], '#dc2626')}</td>"
+            f"<td style='padding:5px'>{badge(s.get('severity', 'medium'), {'high': '#dc2626', 'medium': '#d97706', 'low': '#64748b'}.get(s.get('severity'), '#d97706'))} "
+            f"{badge(s['type'], '#475569')}"
+            + (f"<br><small>{e(s['note'])}</small>" if s.get("note") else "") +
+            f"</td>"
             f"<td style='padding:5px;font-family:monospace'>{e(mask_secret(s['value']))}</td>"
             f"<td style='padding:5px;font-family:monospace;font-size:12px;word-break:break-all'>{loc_html}</td>"
             f"</tr>\n"
@@ -3113,31 +3330,38 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
     # Endpoints
     report_data["endpoints"] = []
     report_data["hidden_endpoints"] = []
-    if args.endpoints and all_js_text:
+    report_data["endpoint_details"] = []
+    if args.endpoints and analysis_files:
         print(f"\n{bold('[Endpoints]')} Scanning...")
-        endpoints, hidden = extract_endpoints(all_js_text)
+        details = find_endpoints_in_files(analysis_files)
+        endpoints = [d["path"] for d in details]
+        hidden = [d["path"] for d in details if d["hidden"]]
         report_data["endpoints"] = endpoints
         report_data["hidden_endpoints"] = hidden
+        report_data["endpoint_details"] = details
 
         ep_path = output_dir / "endpoints.txt"
         ep_path.write_text("\n".join(endpoints), encoding="utf-8")
         hidden_path = output_dir / "endpoints_hidden.txt"
         hidden_path.write_text("\n".join(hidden), encoding="utf-8")
 
-        print(f"  Found {green(str(len(endpoints)))} endpoint(s)  ({red(str(len(hidden)))} flagged as hidden/internal)")
+        with_method = sum(1 for d in details if d["methods"])
+        print(f"  Found {green(str(len(endpoints)))} endpoint(s), {with_method} with a known HTTP method  "
+              f"({red(str(len(hidden)))} flagged as hidden/internal)")
         if hidden:
             print(f"  {red('[!] Hidden/Internal endpoints:')}")
-            for h in hidden:
-                print(f"      {red(h)}")
+            for d in (d for d in details if d["hidden"]):
+                methods = ",".join(d["methods"]) or "?"
+                print(f"      {red(d['path'])}  [{methods}]  {d['file']}:{d['line']}")
         print(f"  Saved -> {ep_path}")
         print(f"  Saved -> {hidden_path}")
 
     # Parameters
     report_data["params"] = []
     report_data["wordlist_path"] = ""
-    if args.params and all_js_text:
+    if args.params and analysis_files:
         print(f"\n{bold('[Params]')} Extracting for fuzzing...")
-        params = extract_params(all_js_text, base_html)
+        params = extract_params("\n".join(t for _, t, _ in analysis_files), base_html)
         report_data["params"] = params
 
         wordlist_path = output_dir / "params_wordlist.txt"
@@ -3160,11 +3384,15 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         secrets_path.write_text(json.dumps(secrets, indent=2, ensure_ascii=False), encoding="utf-8")
 
         if secrets:
-            print(f"  {red(f'[!] {len(secrets)} potential secret(s) found:')}")
+            counts = {k: sum(1 for s in secrets if s["severity"] == k) for k in ("high", "medium", "low")}
+            print(f"  {red(f'[!] {len(secrets)} potential secret(s):')} {counts['high']} high, "
+                  f"{counts['medium']} medium, {counts['low']} low (public-by-design keys)")
             for s in secrets:
                 more = f" (+{len(s['locations']) - 1} more)" if len(s["locations"]) > 1 else ""
-                print(f"      {red('[' + s['type'] + ']')} {mask_secret(s['value'])}  "
-                      f"{s['file']}:{s['line']}{more}")
+                colour = red if s["severity"] == "high" else (yellow if s["severity"] == "medium" else (lambda t: t))
+                note = f"  — {s['note']}" if s.get("note") else ""
+                print(f"      {colour('[' + s['severity'] + '] ' + s['type'])} {mask_secret(s['value'])}  "
+                      f"{s['file']}:{s['line']}{more}{note}")
         else:
             print(f"  {green('No secrets detected.')}")
         print(f"  Saved -> {secrets_path}  (unmasked — handle with care)")
@@ -3277,7 +3505,8 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
 
     # ── Machine-readable results ──────────────────────────────────────────────
     hits = {
-        "secrets": len(report_data.get("secrets", [])),
+        # low = public-by-design keys: listed, but never fail a --fail-on secrets gate
+        "secrets": sum(1 for s in report_data.get("secrets", []) if s["severity"] != "low"),
         "cves": len(report_data.get("cves", [])),
         "hidden-endpoints": len(report_data.get("hidden_endpoints", [])),
         "dom": sum(1 for d in report_data.get("dom_findings", []) if d["severity"] == "high"),
@@ -3306,6 +3535,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         "frameworks": report_data.get("frameworks", []),
         "technologies": report_data.get("technologies", []),
         "endpoints": report_data.get("endpoints", []),
+        "endpoint_details": report_data.get("endpoint_details", []),
         "hidden_endpoints": report_data.get("hidden_endpoints", []),
         "params": report_data.get("params", []),
         "secrets": report_data.get("secrets", []),          # unmasked, like secrets.json

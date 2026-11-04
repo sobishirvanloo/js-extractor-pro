@@ -53,7 +53,7 @@ target_routes = {
     "/": lambda: (200, {"Content-Type": "text/html"},
                   f'<html><script src="/app.js"></script><script src="{THIRD}/cdn.js"></script>'
                   f'<script src="/redir.js"></script></html>'),
-    "/app.js": lambda: (200, {}, 'fetch("/api/<img src=x onerror=alert(1)>");\n'
+    "/app.js": lambda: (200, {}, 'fetch("/api/<svg/onload=alert(1)>");\n'
                                  'var o={"<script>alert(2)</script>":1};\n'
                                  '//# sourceMappingURL=/app.js.map'),
     "/app.js.map": lambda: (200, {}, smap),
@@ -85,8 +85,8 @@ check(any(w.endswith("ok.js") for w in written), "legit source still recovered")
 
 # 2. report XSS
 report = (OUT / "report.html").read_text()
-check("<img src=x" not in report and "<script>alert" not in report, "no raw attacker HTML in report")
-check("&lt;img src=x onerror=alert(1)&gt;" in report, "attacker endpoint shown escaped")
+check("<svg/onload" not in report and "<script>alert" not in report, "no raw attacker HTML in report")
+check("&lt;svg/onload=alert(1)&gt;" in report, "attacker endpoint shown escaped")
 check("Content-Security-Policy" in report, "report has CSP")
 
 # 3. credential scoping

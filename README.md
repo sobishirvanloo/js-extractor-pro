@@ -34,9 +34,19 @@ scanning, framework fingerprinting, and known-CVE lookups.
 - Deep crawl via [katana](https://github.com/projectdiscovery/katana) to discover more JS across the site — `--katana`
 - Historical URL collection via [gau](https://github.com/lc/gau) (Wayback/OTX/CommonCrawl/URLScan) to surface old/forgotten JS — `--gau`
 - Alive-check gau results with [httpx](https://github.com/projectdiscovery/httpx) before extracting — `--httpx-probe`
-- API endpoint discovery, including hidden/internal endpoint highlighting — `--endpoints`
-- Parameter extraction for fuzzing wordlists — `--params`
-- Secret/token/API-key pattern detection — `--secrets`
+- API endpoint discovery — `--endpoints`: each endpoint comes with its HTTP method when the code
+  shows it (`fetch` options, `axios.post`, `xhr.open("PATCH", …)`, `$.ajax({type})`, Angular
+  `HttpClient`) and the file:line it came from; "hidden/internal" is flagged on whole path tokens
+  (`/internal/`, `adminPanel`, `debug`, `actuator`…), so `latest` or `devices` no longer match
+- Parameter extraction for fuzzing wordlists — `--params`: only names that reach a request —
+  query strings, `URLSearchParams`/`FormData`, request bodies (`JSON.stringify({...})`, `body:`/`data:`/
+  `params:`/`variables:`, `axios.post(url, {...})`), route params (`/:id`), GraphQL variables and form fields
+- Secret detection — `--secrets`: ~35 formats (AWS, GitHub, GitLab, Slack, Stripe, Twilio, SendGrid,
+  Mailgun, Mailchimp, npm, PyPI, Shopify, Telegram, Square, OpenAI, Anthropic, Azure, Discord/Slack
+  webhooks, private keys, credentials in URLs, JWTs, …) with a severity: **high** (grants access),
+  **medium** (generic `apiKey`/`secret`/`password` values, after entropy and placeholder filtering),
+  **low** (public by design: Google browser keys, Stripe/Mapbox publishable keys, Sentry DSNs). JWTs are
+  decoded: a Supabase `service_role` key is high, an `anon` key low. `--fail-on secrets` ignores low.
 - **DOM XSS map** — `--dom`: HTML/code/navigation sinks (`innerHTML`, `document.write`, `eval`,
   string `setTimeout`, `location`/`window.open`, `dangerouslySetInnerHTML`, Vue `v-html`, jQuery
   `.html()`, Angular `bypassSecurityTrust*`), `message` handlers without an origin check and
