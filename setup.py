@@ -23,6 +23,7 @@ setup(
     extras_require={
         "dynamic": ["playwright>=1.40.0"],
         "full": ["playwright>=1.40.0"],
+        "dev": ["pytest>=7.0"],
     },
     entry_points={
         "console_scripts": [

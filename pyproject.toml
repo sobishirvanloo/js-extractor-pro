@@ -18,9 +18,13 @@ dependencies = [
 [project.optional-dependencies]
 dynamic = ["playwright>=1.40.0"]
 full = ["playwright>=1.40.0"]
+dev = ["pytest>=7.0"]
 
 [project.scripts]
 js-extractor = "js_extractor.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["js_extractor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

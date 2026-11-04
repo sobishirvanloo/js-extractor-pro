@@ -317,6 +317,22 @@ js_output/
 
 ---
 
+## Testing
+
+```bash
+pip install -e ".[dev]"
+pytest                          # all suites (~40s)
+pytest -k chunks                # a single suite
+python tests/suite_chunks.py    # run one suite directly, with full output
+```
+
+The suites in `tests/suite_*.py` are end-to-end: they start local HTTP/HTTPS servers (simulated
+CRA, Next.js and Vite apps, a fake forward proxy, a self-signed TLS server) and stand-in versions
+of katana, gau, httpx, retire, semgrep and LinkFinder, then run the real CLI against them. Each
+suite runs in its own process because some patch module globals. `openssl` must be on `PATH`
+(it generates the test certificate). CI runs on every push and pull request
+(`.github/workflows/tests.yml`, Python 3.9 and 3.12).
+
 ## Disclaimer
 
 This tool is intended for authorized security testing and research only. Only run it against
