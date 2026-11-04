@@ -37,6 +37,15 @@ scanning, framework fingerprinting, and known-CVE lookups.
 - API endpoint discovery, including hidden/internal endpoint highlighting — `--endpoints`
 - Parameter extraction for fuzzing wordlists — `--params`
 - Secret/token/API-key pattern detection — `--secrets`
+- **DOM XSS map** — `--dom`: HTML/code/navigation sinks (`innerHTML`, `document.write`, `eval`,
+  string `setTimeout`, `location`/`window.open`, `dangerouslySetInnerHTML`, Vue `v-html`, jQuery
+  `.html()`, Angular `bypassSecurityTrust*`), `message` handlers without an origin check and
+  `postMessage(…, "*")`. Constant arguments are ignored; each finding is ranked by source→sink
+  flow (`location.hash`/`search`, `document.referrer`/`cookie`, `window.name`, …):
+  **high** = a source is in the sink's argument, directly, via a variable assigned from one just
+  before, or as `event.data` in an unchecked message handler; **medium** = dynamic code execution
+  or framework bypass without a known source; **low** = other dynamic HTML/navigation sinks.
+  Regex-based triage for DOM Invader / manual review, not proof of exploitability.
 - Library version fingerprinting + CVE lookup via [OSV.dev](https://osv.dev) — `--cve`
 - Optional integrations: `wappalyzer`, `retire.js`, `semgrep`, `LinkFinder`
 - HTML analysis report generation — `--report`
@@ -214,6 +223,7 @@ order). Scripts that turn out to be HTML pages (soft 404s, login redirects, WAF 
 --endpoints                  # Extract API endpoints from all JS
 --params                     # Extract parameters for fuzzing
 --secrets                    # Scan for leaked keys/tokens/passwords
+--dom                        # Map DOM XSS sinks/sources and postMessage issues
 --cve                        # Fingerprint library versions & check OSV.dev for known CVEs
 --wappalyzer                 # Run wappalyzer CLI for tech-stack fingerprinting
 --retire                     # Run retire.js against downloaded JS (local CVE signatures)
@@ -232,7 +242,7 @@ order). Scripts that turn out to be HTML pages (soft 404s, login redirects, WAF 
 --merge                      # Combine all scripts into one file
 --report                     # Generate HTML analysis report
 --json                       # Print results.json to stdout (progress goes to stderr)
---fail-on LIST               # Exit 3 if found: secrets,cves,hidden-endpoints,retire,semgrep
+--fail-on LIST               # Exit 3 if found: secrets,cves,hidden-endpoints,retire,semgrep,dom (high)
 ```
 
 `results.json` is always written. It holds every finding (secrets unmasked), the file list, the
@@ -307,6 +317,7 @@ js_output/
 ├── results.json             # always: all findings + stats, machine-readable
 ├── routes.txt               # (Next.js) client-side routes from _buildManifest.js
 ├── out_of_scope.txt         # (with --scope/--exclude-host) script URLs skipped as out of scope
+├── dom_sinks.json           # (with --dom) sinks ranked by severity, with file:line + code
 ├── secrets.json             # (with --secrets) unmasked values + every file:line location
 ├── cve_report.txt           # (with --cve)
 ├── retire_report.txt        # (with --retire)
