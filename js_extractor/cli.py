@@ -64,6 +64,7 @@ Output:
 import argparse
 import base64
 import bisect
+import contextlib
 import fnmatch
 import ipaddress
 import hashlib
@@ -72,7 +73,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.parse
 from collections import defaultdict
 from datetime import datetime
@@ -268,44 +271,135 @@ class ScopedAuth(requests.auth.AuthBase):
 
 MAX_REDIRECTS = 10
 
+
+class RateLimiter:
+    """
+    Global requests-per-second cap shared by every download thread (a simple
+    scheduled-slot limiter: each request reserves the next free slot).
+    rate <= 0 disables it.
+    """
+
+    def __init__(self, rate: float):
+        self.interval = 1.0 / rate if rate and rate > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def wait(self):
+        if not self.interval:
+            return
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next)
+            self._next = slot + self.interval
+        if slot > now:
+            time.sleep(slot - now)
+
+
+def make_session(args, scope, limiter=None, max_bytes=0, cookies=None) -> requests.Session:
+    """
+    Build a configured Session (headers, scoped auth, scope, proxy, TLS,
+    rate limit, size cap). requests.Session isn't guaranteed thread-safe, so
+    each download thread gets its own; `cookies` seeds it with cookies the
+    target set on the main session (WAF/session cookies some sites require).
+    """
+    s = requests.Session()
+    s.headers.update(build_headers(args))
+    # Credentials go only to the auth scope (see ScopedAuth)
+    s.auth = ScopedAuth(args.url, build_auth_headers(args), build_cookies(args),
+                        mode=getattr(args, "auth_scope", "host"))
+    s.scope = scope                       # enforced in fetch(), per redirect hop
+    s.limiter = limiter
+    s.max_bytes = max_bytes
+    if getattr(args, "proxy", None):
+        s.proxies = {"http": args.proxy, "https": args.proxy}
+    if getattr(args, "insecure", False):
+        s.verify = False
+    elif getattr(args, "ca_cert", None):
+        s.verify = args.ca_cert
+    if cookies is not None:
+        s.cookies.update(cookies)
+    return s
+
+
 def fetch(url: str, session: requests.Session, quiet: bool = False):
     """
-    GET a URL. Returns Response or None on failure.
+    GET a URL. Returns Response or None on failure; on failure
+    session.fetch_error holds a short reason ("out_of_scope", "too_large",
+    "tls", "proxy", "error").
 
     Redirects are followed manually so that session.auth (ScopedAuth) and
     session.scope (Scope) are re-evaluated for every hop; with requests'
     built-in redirect handling, custom headers would be carried over to a
     redirect target on another host, and redirects could leave the scope.
+    Every hop also waits on the shared rate limiter, and bodies are streamed
+    so session.max_bytes can abort oversized downloads early.
     """
     scope = getattr(session, "scope", None)
+    limiter = getattr(session, "limiter", None)
+    max_bytes = getattr(session, "max_bytes", 0) or 0
+    session.fetch_error = None
     try:
         for _ in range(MAX_REDIRECTS + 1):
             if scope is not None and not scope.allows(url):
+                session.fetch_error = "out_of_scope"
                 if not quiet:
                     print(f"  {yellow('[SKIP]')} Out of scope ({scope.describe()}): {url}")
                 return None
-            resp = session.get(url, timeout=20, allow_redirects=False)
+            if limiter is not None:
+                limiter.wait()
+            resp = session.get(url, timeout=20, allow_redirects=False, stream=True)
             if resp.is_redirect:
+                resp.close()
                 url = urljoin(resp.url, resp.headers["Location"])
                 continue
-            resp.raise_for_status()
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError:
+                resp.close()
+                raise
+            if max_bytes:
+                declared = resp.headers.get("Content-Length", "")
+                if declared.isdigit() and int(declared) > max_bytes:
+                    resp.close()
+                    return _too_large(session, url, int(declared), max_bytes, quiet)
+                body = bytearray()
+                for chunk in resp.iter_content(65536):
+                    body += chunk
+                    if len(body) > max_bytes:
+                        resp.close()
+                        return _too_large(session, url, len(body), max_bytes, quiet, partial=True)
+                resp._content = bytes(body)          # pre-load so .text/.content work
+            else:
+                resp.content                          # read the whole body
             return resp
         raise requests.exceptions.TooManyRedirects(f"Exceeded {MAX_REDIRECTS} redirects")
     except requests.exceptions.SSLError as e:
+        session.fetch_error = "tls"
         if not quiet:
             print(f"  {yellow('[WARN]')} TLS verification failed for {url}: {e}\n"
                   f"         Self-signed/internal CA or intercepting proxy? "
                   f"Use --ca-cert PATH or --insecure.", file=sys.stderr)
         return None
     except requests.exceptions.ProxyError as e:
+        session.fetch_error = "proxy"
         if not quiet:
             print(f"  {yellow('[WARN]')} Proxy error fetching {url}: {e}\n"
                   f"         Is the proxy running and reachable?", file=sys.stderr)
         return None
     except requests.exceptions.RequestException as e:
+        session.fetch_error = "error"
         if not quiet:
             print(f"  {yellow('[WARN]')} Could not fetch {url}: {e}", file=sys.stderr)
         return None
+
+
+def _too_large(session, url, size, limit, quiet, partial=False):
+    session.fetch_error = "too_large"
+    if not quiet:
+        size_txt = f">{limit / 1048576:.0f}" if partial else f"{size / 1048576:.1f}"
+        print(f"  {yellow('[SKIP]')} {url} is {size_txt} MB, over --max-size "
+              f"{limit / 1048576:.0f} MB", file=sys.stderr)
+    return None
 
 
 def resolve(src: str, base: str):
@@ -1875,6 +1969,29 @@ def generate_report(data: dict, out_dir: Path) -> Path:
 # Main orchestrator
 # ══════════════════════════════════════════════════════════════════════════════
 
+FAIL_ON_CHOICES = ("secrets", "cves", "hidden-endpoints", "retire", "semgrep")
+
+try:
+    from js_extractor import __version__
+except ImportError:                       # run directly as a script
+    __version__ = "unknown"
+
+
+def looks_like_html(text: str) -> bool:
+    """A 'script' that is really an HTML page (soft 404, login redirect, WAF page)."""
+    head = text.lstrip("﻿ \t\r\n")[:64].lower()
+    return head.startswith("<!doctype html") or head.startswith("<html")
+
+
+def write_results(path: Path, results: dict, stream=None):
+    """Write results.json and, with --json, the same document to `stream`."""
+    doc = json.dumps(results, indent=2, ensure_ascii=False, default=str)
+    path.write_text(doc + "\n", encoding="utf-8")
+    if stream is not None:
+        stream.write(doc + "\n")
+        stream.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="JS Extractor v2 — extract, beautify, and analyze all JS from a web page",
@@ -1906,6 +2023,17 @@ def main():
     net.add_argument("--ca-cert", default=None, metavar="PATH",
         help="Verify TLS against this CA bundle (e.g. Burp's exported CA in PEM). "
              "Not usable by --dynamic: Chromium needs --insecure behind an intercepting proxy")
+
+    # Performance
+    perf = parser.add_argument_group("Performance")
+    perf.add_argument("--threads", "-t", type=int, default=5, metavar="N",
+        help="Parallel script downloads (default: 5)")
+    perf.add_argument("--rate-limit", type=float, default=10, metavar="RPS",
+        help="Max requests per second across all threads, 0 = unlimited (default: 10)")
+    perf.add_argument("--max-files", type=int, default=0, metavar="N",
+        help="Download at most N external scripts, 0 = unlimited (default). Useful with --gau")
+    perf.add_argument("--max-size", type=float, default=30, metavar="MB",
+        help="Skip any response larger than this, 0 = unlimited (default: 30 MB)")
 
     # Scope
     scp = parser.add_argument_group("Scope")
@@ -1985,13 +2113,50 @@ def main():
         help="Combine all scripts into ALL_SCRIPTS_MERGED.js")
     out.add_argument("--report", action="store_true",
         help="Generate an HTML analysis report")
+    out.add_argument("--json", action="store_true",
+        help="Print machine-readable results (same as results.json, which is always written) to "
+             "stdout; all progress output goes to stderr")
+    out.add_argument("--fail-on", default="", metavar="LIST",
+        help="Exit with code 3 if any of these were found (comma-separated): "
+             f"{', '.join(FAIL_ON_CHOICES)}. For CI / scripting")
 
     args = parser.parse_args()
+
+    fail_on = [f.strip() for f in args.fail_on.split(",") if f.strip()]
+    bad = [f for f in fail_on if f not in FAIL_ON_CHOICES]
+    if bad:
+        parser.error(f"--fail-on: unknown value(s) {', '.join(bad)}; choose from {', '.join(FAIL_ON_CHOICES)}")
+    if not 1 <= args.threads <= 64:
+        parser.error("--threads must be between 1 and 64")
+    if args.rate_limit < 0 or args.max_files < 0 or args.max_size < 0:
+        parser.error("--rate-limit, --max-files and --max-size must not be negative")
+
+    # --json: stdout carries only the JSON document; all progress → stderr
+    if args.json:
+        json_stream = sys.stdout
+        with contextlib.redirect_stdout(sys.stderr):
+            code = _run(args, parser, fail_on, json_stream)
+    else:
+        code = _run(args, parser, fail_on, None)
+    if code:
+        sys.exit(code)
+
+
+def _run(args, parser, fail_on: list, json_stream) -> int:
+    """Everything after argument parsing. Returns the process exit code."""
+    started = time.monotonic()
 
     # --all-analysis shortcut
     if args.all_analysis:
         args.endpoints = args.params = args.secrets = args.cve = True
         args.wappalyzer = args.retire = args.semgrep = args.linkfinder = True
+
+    # --fail-on X implies the analysis that produces X (otherwise it could
+    # never trigger and a CI gate would silently always pass)
+    for f, flag in (("secrets", "secrets"), ("cves", "cve"), ("hidden-endpoints", "endpoints"),
+                    ("retire", "retire"), ("semgrep", "semgrep")):
+        if f in fail_on:
+            setattr(args, flag, True)
 
     if args.tool_timeout is not None and args.tool_timeout <= 0:
         parser.error("--tool-timeout must be a positive number of seconds")
@@ -2022,20 +2187,12 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    session = requests.Session()
-    session.headers.update(build_headers(args))
-    # Credentials go only to the auth scope (see ScopedAuth)
-    session.auth = ScopedAuth(args.url, build_auth_headers(args), build_cookies(args),
-                              mode=args.auth_scope)
-    session.scope = scope                       # enforced in fetch(), per redirect hop
-    if args.proxy:
-        session.proxies = {"http": args.proxy, "https": args.proxy}
+    limiter = RateLimiter(args.rate_limit)
+    max_bytes = int(args.max_size * 1048576) if args.max_size else 0
+    session = make_session(args, scope, limiter, max_bytes)
     if args.insecure:
-        session.verify = False
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    elif args.ca_cert:
-        session.verify = args.ca_cert
 
     # ── Step 1: Fetch the page ────────────────────────────────────────────────
     print(f"\n{bold('[*]')} Target: {cyan(args.url)}")
@@ -2057,7 +2214,11 @@ def main():
     print()
     resp = fetch(args.url, session)
     if not resp:
-        sys.exit(1)
+        write_results(output_dir / "results.json", {
+            "tool": "js-extractor", "version": __version__, "target": args.url,
+            "error": f"could not fetch target ({session.fetch_error or 'error'})",
+        }, json_stream)
+        return 1
     base_html = resp.text
 
     # Tech-stack fingerprinting (independent of JS extraction, so run it first)
@@ -2172,66 +2333,90 @@ def main():
     analysis_files = []
 
     # ── Step 3: Download & beautify external scripts ──────────────────────────
+    skipped = {"failed": [], "too_large": [], "not_javascript": [], "max_files": []}
+
     if not args.no_external:
         ext_dir = output_dir / "external"
-        seen = set()
-        queue = list(all_ext_urls)
+        local = threading.local()
+        target_cookies = session.cookies.copy()      # cookies the target set on page load
 
-        while queue:
-            src_url = queue.pop(0)
-            if src_url in seen:
-                continue
-            seen.add(src_url)
-            if not scope.allows(src_url):          # imports/workers found along the way
-                out_of_scope.append(src_url)
-                continue
+        def thread_session():
+            if not hasattr(local, "session"):
+                local.session = make_session(args, scope, limiter, max_bytes, target_cookies)
+            return local.session
 
+        def download(idx: int, src_url: str) -> dict:
+            """Network + CPU part, run in worker threads. No shared state touched."""
+            s = thread_session()
             print(f"  {cyan('[DL]')} {src_url}")
-            js_resp = fetch(src_url, session)
+            js_resp = fetch(src_url, s)
             if not js_resp:
-                continue
-
+                return {"idx": idx, "url": src_url, "error": s.fetch_error or "error"}
             raw = js_resp.text
-            print(f"       Beautifying ({len(raw):,} chars)...")
-            beautified = beautify(raw)
-            all_js_text += beautified + "\n"
-
-            fname = safe_filename(src_url, prefix=f"ext_{len(seen):03d}")
-            fpath = ext_dir / fname
-            header_lines = save_js(beautified, fpath, url=src_url)
-            analysis_files.append((str(fpath.relative_to(output_dir)), beautified, header_lines))
-
-            size_kb = fpath.stat().st_size / 1024
-            file_records.append({"kind": "external", "filename": fname,
-                                  "url": src_url, "saved_path": str(fpath.relative_to(output_dir)),
-                                  "size_kb": size_kb})
-
-            # Source map recovery
+            if looks_like_html(raw):
+                print(f"  {yellow('[SKIP]')} {src_url} returned an HTML page, not JS (soft 404 / login / WAF?)")
+                return {"idx": idx, "url": src_url, "error": "not_javascript"}
+            recovered = []
             if not args.no_sourcemaps:
-                try_recover_sourcemap(raw, src_url, session, output_dir,
-                                      headers=js_resp.headers, written=recovered_paths)
+                try_recover_sourcemap(raw, src_url, s, output_dir,
+                                      headers=js_resp.headers, written=recovered)
+            return {
+                "idx": idx, "url": src_url, "error": None,
+                "beautified": beautify(raw),
+                "recovered": recovered,
+                "imports": [] if args.no_imports else find_js_imports(raw, src_url),
+                "workers": [] if args.no_workers else find_workers(raw, src_url),
+            }
 
-            # Follow imports
-            if not args.no_imports:
-                for imp_url in find_js_imports(raw, src_url):
-                    if imp_url not in seen:
-                        queue.append(imp_url)
-                        imports_to_fetch.add(imp_url)
+        # Breadth-first in waves: each wave downloads in parallel, then results
+        # are handled in submission order, so file numbering and analysis
+        # output are identical from run to run regardless of thread timing.
+        seen, pending, n_queued = set(), list(all_ext_urls), 0
+        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+            while pending:
+                wave = []
+                for u in pending:
+                    if u in seen:
+                        continue
+                    seen.add(u)
+                    if not scope.allows(u):            # imports/workers found along the way
+                        out_of_scope.append(u)
+                    elif args.max_files and n_queued >= args.max_files:
+                        skipped["max_files"].append(u)
+                    else:
+                        n_queued += 1
+                        wave.append((n_queued, u))
+                pending = []
 
-            # Find workers
-            if not args.no_workers:
-                for w_url in find_workers(raw, src_url):
-                    if w_url not in seen:
-                        workers_to_fetch.add(w_url)
-                        queue.append(w_url)
+                for res in pool.map(lambda iu: download(*iu), wave):
+                    if res["error"] == "out_of_scope":   # redirected out of scope
+                        out_of_scope.append(res["url"])
+                        continue
+                    if res["error"]:
+                        key = res["error"] if res["error"] in skipped else "failed"
+                        skipped[key].append(res["url"])
+                        continue
+                    src_url, beautified = res["url"], res["beautified"]
+                    all_js_text += beautified + "\n"
+                    fname = safe_filename(src_url, prefix=f"ext_{res['idx']:03d}")
+                    fpath = ext_dir / fname
+                    header_lines = save_js(beautified, fpath, url=src_url)
+                    analysis_files.append((str(fpath.relative_to(output_dir)), beautified, header_lines))
+                    file_records.append({"kind": "external", "filename": fname,
+                                         "url": src_url, "saved_path": str(fpath.relative_to(output_dir)),
+                                         "size_kb": fpath.stat().st_size / 1024})
+                    recovered_paths.extend(res["recovered"])
+                    imports_to_fetch.update(res["imports"])
+                    workers_to_fetch.update(res["workers"])
+                    pending += [u for u in res["imports"] + res["workers"] if u not in seen]
+                    all_contents_merge.append(
+                        f"\n\n{'='*70}\n// FILE: {fname}\n// SOURCE: {src_url}\n{'='*70}\n\n"
+                        + beautified
+                    )
 
-            if all_contents_merge is not None:
-                all_contents_merge.append(
-                    f"\n\n{'='*70}\n// FILE: {fname}\n// SOURCE: {src_url}\n{'='*70}\n\n"
-                    + beautified
-                )
-
-            time.sleep(0.15)  # polite pacing
+        if skipped["max_files"]:
+            print(f"\n  {yellow('[Limit]')} --max-files {args.max_files} reached: "
+                  f"{len(skipped['max_files'])} script(s) not downloaded")
 
     if out_of_scope:
         oos_path = output_dir / "out_of_scope.txt"
@@ -2452,16 +2637,71 @@ def main():
         rpath = generate_report(report_data, output_dir)
         print(f"\n{green('[Report]')} HTML report -> {rpath}")
 
+    # ── Machine-readable results ──────────────────────────────────────────────
+    hits = {
+        "secrets": len(report_data.get("secrets", [])),
+        "cves": len(report_data.get("cves", [])),
+        "hidden-endpoints": len(report_data.get("hidden_endpoints", [])),
+        "retire": sum(len(r["vulnerabilities"]) for r in report_data.get("retire_findings", [])),
+        "semgrep": len(report_data.get("semgrep_findings", [])),
+    }
+    results = {
+        "tool": "js-extractor",
+        "version": __version__,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "target": args.url,
+        "final_url": resp.url,
+        "scope": {"mode": args.scope, "allowed": scope.describe(), "auth_scope": args.auth_scope},
+        "stats": {
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "external_downloaded": sum(1 for f in file_records if f["kind"] == "external"),
+            "inline_blocks": sum(1 for f in file_records if f["kind"] == "inline"),
+            "sourcemap_files": report_data.get("sourcemap_files", {}),
+            "out_of_scope": len(set(out_of_scope)),
+            **{f"skipped_{k}": len(v) for k, v in skipped.items()},
+            "findings": hits,
+        },
+        "files": [{k: f[k] for k in ("kind", "url", "saved_path")} | {"size_kb": round(f["size_kb"], 1)}
+                  for f in file_records],
+        "frameworks": report_data.get("frameworks", []),
+        "technologies": report_data.get("technologies", []),
+        "endpoints": report_data.get("endpoints", []),
+        "hidden_endpoints": report_data.get("hidden_endpoints", []),
+        "params": report_data.get("params", []),
+        "secrets": report_data.get("secrets", []),          # unmasked, like secrets.json
+        "libraries": report_data.get("libraries", []),
+        "cves": report_data.get("cves", []),
+        "retire_findings": report_data.get("retire_findings", []),
+        "semgrep_findings": report_data.get("semgrep_findings", []),
+        "linkfinder_endpoints": report_data.get("linkfinder_endpoints", []),
+        "out_of_scope": list(dict.fromkeys(out_of_scope)),
+        "skipped": skipped,
+    }
+    results_path = output_dir / "results.json"
+    write_results(results_path, results, json_stream)
+
     # ── Summary ───────────────────────────────────────────────────────────────
     js_files = list(output_dir.rglob("*.js"))
     total_kb = sum(f.stat().st_size for f in js_files) / 1024
     print(f"\n{'─'*55}")
-    print(f"{green('[+]')} Done — {len(js_files)} JS file(s), {total_kb:.1f} KB total")
+    print(f"{green('[+]')} Done in {results['stats']['elapsed_seconds']:.1f}s — "
+          f"{len(js_files)} JS file(s), {total_kb:.1f} KB total")
+    n_skipped = sum(len(v) for v in skipped.values())
+    if n_skipped:
+        print(f"    Skipped: " + ", ".join(f"{len(v)} {k.replace('_', ' ')}" for k, v in skipped.items() if v)
+              + "  (see results.json)")
     print(f"    Output dir: {output_dir.resolve()}")
+    print(f"    Results:    {results_path}")
     print(f"{'─'*55}")
     print(f"{cyan('[Manual step]')} Live source→sink tracing (DOM Invader in Burp Suite) "
           f"isn't automatable — load {args.url} in a Burp-proxied browser with DOM Invader "
           f"enabled and use the beautified JS + endpoints/params above as your map.\n")
+
+    triggered = [f for f in fail_on if hits.get(f)]
+    if triggered:
+        print(f"{red('[FAIL]')} --fail-on matched: " + ", ".join(f"{f} ({hits[f]})" for f in triggered))
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

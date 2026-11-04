@@ -158,6 +158,18 @@ add `--ca-cert` (export Burp's CA and convert it with `openssl x509 -inform der 
 or `--insecure`; `--dynamic` always needs `--insecure` there, since Chromium can't load a CA file.
 SOCKS proxies need `pip install "requests[socks]"`.
 
+### Performance
+
+```bash
+--threads N, -t N            # parallel script downloads (default: 5)
+--rate-limit RPS             # max requests/second across all threads, 0 = unlimited (default: 10)
+--max-files N                # download at most N external scripts, 0 = unlimited (default)
+--max-size MB                # skip any response larger than this, 0 = unlimited (default: 30)
+```
+
+Output is identical from run to run regardless of thread timing (files are numbered in discovery
+order). Scripts that turn out to be HTML pages (soft 404s, login redirects, WAF pages) are skipped.
+
 ### Scope
 
 ```bash
@@ -212,6 +224,21 @@ SOCKS proxies need `pip install "requests[socks]"`.
 --output-dir  ./js_output    # Output directory (default: ./js_output)
 --merge                      # Combine all scripts into one file
 --report                     # Generate HTML analysis report
+--json                       # Print results.json to stdout (progress goes to stderr)
+--fail-on LIST               # Exit 3 if found: secrets,cves,hidden-endpoints,retire,semgrep
+```
+
+`results.json` is always written. It holds every finding (secrets unmasked), the file list, the
+out-of-scope and skipped URLs, and run stats. Exit codes: `0` ok, `1` target unreachable,
+`2` bad arguments, `3` a `--fail-on` category matched. `--fail-on X` turns on the analysis that
+produces `X`.
+
+```bash
+# CI gate: fail the build if the deployed JS leaks a secret
+js-extractor https://staging.example.com --fail-on secrets --json > js-results.json
+
+# pipe endpoints into other tools
+js-extractor https://example.com --endpoints --json | jq -r '.endpoints[]' | sort -u
 ```
 
 ### Examples
@@ -270,6 +297,7 @@ js_output/
 ├── gau_all.txt              # (with --gau, no probe)
 ├── gau_alive.txt            # (with --gau --httpx-probe) — "status_code  url" per line
 ├── params_wordlist.txt      # (with --params)
+├── results.json             # always: all findings + stats, machine-readable
 ├── out_of_scope.txt         # (with --scope/--exclude-host) script URLs skipped as out of scope
 ├── secrets.json             # (with --secrets) unmasked values + every file:line location
 ├── cve_report.txt           # (with --cve)
