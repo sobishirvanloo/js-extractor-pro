@@ -137,7 +137,41 @@ python3 js_extractor/cli.py <url> [options]
 --cookie "name=value; name2=value2"
 --jwt    "eyJ..."
 --header "Key: Value"        # repeatable
+--auth-scope host|domain     # where credentials are sent (default: exact target host only)
 ```
+
+Credentials are never sent to third-party hosts (CDNs, analytics, cross-origin scripts,
+redirect targets). Use `--auth-scope domain` when the app shares one session across
+`app.` / `api.` / `auth.` subdomains.
+
+### Network
+
+```bash
+--proxy URL                  # e.g. http://127.0.0.1:8080 (Burp/ZAP) or socks5://127.0.0.1:9050
+--insecure, -k               # skip TLS verification (self-signed targets, intercepting proxies)
+--ca-cert PATH               # verify TLS against a CA bundle instead (e.g. Burp's CA as PEM)
+```
+
+`--proxy` covers all traffic to the target: the static fetcher, `--dynamic`, katana and httpx.
+gau, OSV.dev and semgrep only talk to public services and are not proxied. Behind Burp/ZAP,
+add `--ca-cert` (export Burp's CA and convert it with `openssl x509 -inform der -in cacert.der -out burp.pem`)
+or `--insecure`; `--dynamic` always needs `--insecure` there, since Chromium can't load a CA file.
+SOCKS proxies need `pip install "requests[socks]"`.
+
+### Scope
+
+```bash
+--scope any|domain|host      # hosts the tool may contact at all (default: any)
+--include-host PATTERN       # extra allowed host for domain/host mode, glob OK (repeatable)
+--exclude-host PATTERN       # never contact this host, glob OK, wins over everything (repeatable)
+```
+
+- `domain` = the target's registrable domain and all its subdomains; `host` = the exact target host.
+- Out-of-scope scripts are listed in `out_of_scope.txt` instead of being fetched, and redirects
+  that leave the scope are blocked.
+- The scope also narrows katana (`-fs fqdn` for `host`), gau (no `--subs` for `host`, results
+  filtered) and httpx (same-host redirects only). `--dynamic` aborts out-of-scope requests inside
+  the browser. wappalyzer runs its own browser and does **not** honour `--scope` or `--proxy`.
 
 ### Extraction
 
@@ -181,6 +215,16 @@ python3 js_extractor/cli.py <url> [options]
 ```
 
 ### Examples
+
+Through Burp, staying strictly on the target's domain:
+
+```bash
+js-extractor https://app.target.com \
+  --proxy http://127.0.0.1:8080 --ca-cert burp.pem \
+  --scope domain --exclude-host "*.google-analytics.com" \
+  --cookie "session=abc123" --auth-scope domain \
+  --endpoints --secrets --report
+```
 
 Basic static extraction:
 
@@ -226,6 +270,7 @@ js_output/
 ├── gau_all.txt              # (with --gau, no probe)
 ├── gau_alive.txt            # (with --gau --httpx-probe) — "status_code  url" per line
 ├── params_wordlist.txt      # (with --params)
+├── out_of_scope.txt         # (with --scope/--exclude-host) script URLs skipped as out of scope
 ├── secrets.json             # (with --secrets) unmasked values + every file:line location
 ├── cve_report.txt           # (with --cve)
 ├── retire_report.txt        # (with --retire)

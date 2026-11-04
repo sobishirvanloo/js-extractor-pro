@@ -64,6 +64,8 @@ Output:
 import argparse
 import base64
 import bisect
+import fnmatch
+import ipaddress
 import hashlib
 import json
 import re
@@ -156,24 +158,100 @@ def build_cookies(args) -> dict:
     return cookies
 
 
-class ScopedAuth(requests.auth.AuthBase):
+# Second-level labels that form a public suffix together with a 2-letter
+# ccTLD (example.co.uk, example.com.au, example.ac.ir, ...). A heuristic —
+# no public-suffix list dependency; use --include-host for edge cases.
+_SLD_SUFFIXES = {"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go",
+                 "gob", "gv", "mil", "nic", "ltd", "plc", "sch", "id", "info"}
+
+
+def base_domain(host: str) -> str:
+    """Approximate registrable domain: app.example.co.uk -> example.co.uk."""
+    host = (host or "").lower().rstrip(".")
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return host                                 # IPs have no parent domain
+    except ValueError:
+        pass
+    labels = host.split(".")
+    if len(labels) >= 3 and len(labels[-1]) == 2 and labels[-2] in _SLD_SUFFIXES:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def host_in_domain(host: str, domain: str) -> bool:
+    host, domain = host.lower().rstrip("."), domain.lower().rstrip(".")
+    return host == domain or host.endswith("." + domain)
+
+
+class Scope:
     """
-    Attach the user's auth headers / cookies only to requests whose host is
-    exactly the target host (and never downgrade https -> http). Everything
-    else — CDNs, analytics, cross-origin imports, source maps, gau URLs on
-    other subdomains — is fetched without credentials.
+    Which hosts the tool may send ANY request to (--scope):
+      any    — everything (default, previous behaviour)
+      domain — the target's registrable domain and all its subdomains
+      host   — the exact target host only
+    --include-host adds hosts (glob) to host/domain modes; --exclude-host
+    (glob) always wins. The target URL itself is always allowed.
     """
 
-    def __init__(self, target_url: str, headers: dict, cookies: dict):
+    MODES = ("any", "domain", "host")
+
+    def __init__(self, target_url: str, mode: str = "any", include=(), exclude=()):
+        self.host = (urlparse(target_url).hostname or "").lower()
+        self.domain = base_domain(self.host)
+        self.mode = mode
+        self.include = [p.lower() for p in (include or [])]
+        self.exclude = [p.lower() for p in (exclude or [])]
+
+    @property
+    def restricted(self) -> bool:
+        return self.mode != "any" or bool(self.exclude)
+
+    def allows(self, url: str) -> bool:
+        host = (urlparse(url).hostname or "").lower()
+        if not host:
+            return False
+        if any(fnmatch.fnmatchcase(host, p) for p in self.exclude):
+            return False
+        if self.mode == "any" or host == self.host:
+            return True
+        if any(fnmatch.fnmatchcase(host, p) for p in self.include):
+            return True
+        return self.mode == "domain" and host_in_domain(host, self.domain)
+
+    def describe(self) -> str:
+        what = {"any": "any host", "domain": f"*.{self.domain}", "host": self.host}[self.mode]
+        extra = "".join(f" +{p}" for p in self.include) + "".join(f" -{p}" for p in self.exclude)
+        return what + extra
+
+
+class ScopedAuth(requests.auth.AuthBase):
+    """
+    Attach the user's auth headers / cookies only to requests for the target
+    (never downgrading https -> http). Everything else — CDNs, analytics,
+    cross-origin imports, source maps, gau URLs — is fetched without
+    credentials. mode (--auth-scope):
+      host   — exact target host only (default)
+      domain — target's registrable domain and its subdomains (for apps
+               split across app./api./auth. that share a session)
+    """
+
+    def __init__(self, target_url: str, headers: dict, cookies: dict, mode: str = "host"):
         parsed = urlparse(target_url)
         self.host = (parsed.hostname or "").lower()
+        self.domain = base_domain(self.host)
+        self.mode = mode
         self.scheme = parsed.scheme.lower()
         self.headers = dict(headers or {})
         self.cookie_str = "; ".join(f"{k}={v}" for k, v in (cookies or {}).items())
 
     def in_scope(self, url: str) -> bool:
         parsed = urlparse(url)
-        if (parsed.hostname or "").lower() != self.host:
+        host = (parsed.hostname or "").lower()
+        if self.mode == "domain":
+            if not host_in_domain(host, self.domain):
+                return False
+        elif host != self.host:
             return False
         if self.scheme == "https" and parsed.scheme.lower() != "https":
             return False
@@ -194,12 +272,18 @@ def fetch(url: str, session: requests.Session, quiet: bool = False):
     """
     GET a URL. Returns Response or None on failure.
 
-    Redirects are followed manually so that session.auth (ScopedAuth) is
-    re-evaluated for every hop; with requests' built-in redirect handling,
-    custom headers would be carried over to a redirect target on another host.
+    Redirects are followed manually so that session.auth (ScopedAuth) and
+    session.scope (Scope) are re-evaluated for every hop; with requests'
+    built-in redirect handling, custom headers would be carried over to a
+    redirect target on another host, and redirects could leave the scope.
     """
+    scope = getattr(session, "scope", None)
     try:
         for _ in range(MAX_REDIRECTS + 1):
+            if scope is not None and not scope.allows(url):
+                if not quiet:
+                    print(f"  {yellow('[SKIP]')} Out of scope ({scope.describe()}): {url}")
+                return None
             resp = session.get(url, timeout=20, allow_redirects=False)
             if resp.is_redirect:
                 url = urljoin(resp.url, resp.headers["Location"])
@@ -207,6 +291,17 @@ def fetch(url: str, session: requests.Session, quiet: bool = False):
             resp.raise_for_status()
             return resp
         raise requests.exceptions.TooManyRedirects(f"Exceeded {MAX_REDIRECTS} redirects")
+    except requests.exceptions.SSLError as e:
+        if not quiet:
+            print(f"  {yellow('[WARN]')} TLS verification failed for {url}: {e}\n"
+                  f"         Self-signed/internal CA or intercepting proxy? "
+                  f"Use --ca-cert PATH or --insecure.", file=sys.stderr)
+        return None
+    except requests.exceptions.ProxyError as e:
+        if not quiet:
+            print(f"  {yellow('[WARN]')} Proxy error fetching {url}: {e}\n"
+                  f"         Is the proxy running and reachable?", file=sys.stderr)
+        return None
     except requests.exceptions.RequestException as e:
         if not quiet:
             print(f"  {yellow('[WARN]')} Could not fetch {url}: {e}", file=sys.stderr)
@@ -301,40 +396,60 @@ def extract_dynamic(url: str, args) -> tuple[list[str], list[str]]:
     collected_urls = []
     inline_blocks = []
 
-    # Auth headers are injected per-request (target host only) via a route
+    proxy = getattr(args, "proxy", None)
+    insecure = bool(getattr(args, "insecure", False))
+    auth_mode = getattr(args, "auth_scope", "host") or "host"
+    fetch_scope = Scope(url, getattr(args, "scope", "any") or "any",
+                        getattr(args, "include_host", None), getattr(args, "exclude_host", None))
+
+    # Auth headers are injected per-request (auth scope only) via a route
     # handler — NOT via extra_http_headers, which would send them everywhere.
     extra_headers = build_auth_headers(args)
-    scope = ScopedAuth(url, extra_headers, {})
+    scope = ScopedAuth(url, extra_headers, {}, mode=auth_mode)
 
-    # Cookies bound to the target URL are host-only (no subdomains, no 3rd parties)
+    # Cookies: host-only by default; with --auth-scope domain they're set on
+    # the registrable domain so the browser sends them to its subdomains too.
+    cookie_target = ({"domain": "." + scope.domain, "path": "/"} if auth_mode == "domain"
+                     else {"url": url})
     pw_cookies = [
-        {"name": k, "value": v, "url": url}
+        {"name": k, "value": v, **cookie_target}
         for k, v in build_cookies(args).items()
     ]
+    blocked = []
 
     # Any failure here (Chromium not installed, navigation error, page never
     # going network-idle, page crash) must not kill the whole run: whatever
     # was captured so far is returned and the static results still stand.
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            launch_opts = {"headless": True}
+            if proxy:
+                launch_opts["proxy"] = {"server": proxy}
+            browser = pw.chromium.launch(**launch_opts)
             try:
-                context = browser.new_context(ignore_https_errors=True)
+                # TLS errors are only ignored with --insecure (Chromium can't be
+                # pointed at a CA file, so intercepting proxies need --insecure).
+                context = browser.new_context(ignore_https_errors=insecure)
                 if pw_cookies:
                     context.add_cookies(pw_cookies)
-                if extra_headers:
-                    def add_scoped_headers(route, request):
-                        if scope.in_scope(request.url):
+                if extra_headers or fetch_scope.restricted:
+                    def route_handler(route, request):
+                        # Out-of-scope requests never leave the browser
+                        if not fetch_scope.allows(request.url) and request.url.startswith("http"):
+                            blocked.append(request.url)
+                            route.abort("blockedbyclient")
+                        elif extra_headers and scope.in_scope(request.url):
                             route.continue_(headers={**request.headers, **extra_headers})
                         else:
                             route.continue_()
-                    context.route("**/*", add_scoped_headers)
+                    context.route("**/*", route_handler)
 
                 page = context.new_page()
 
-                # Intercept every network request
+                # Intercept every network request ("request" also fires for
+                # requests the route handler then aborts — skip those)
                 def on_request(request):
-                    if request.resource_type == "script":
+                    if request.resource_type == "script" and fetch_scope.allows(request.url):
                         collected_urls.append(request.url)
 
                 page.on("request", on_request)
@@ -369,6 +484,9 @@ def extract_dynamic(url: str, args) -> tuple[list[str], list[str]]:
               f" — continuing with {len(collected_urls)} script(s) captured so far")
 
     collected_urls = list(dict.fromkeys(collected_urls))
+    if blocked:
+        print(f"  {yellow('[Scope]')} Browser blocked {len(set(blocked))} out-of-scope request(s) "
+              f"({fetch_scope.describe()})")
     print(cyan(f"  [Browser] Captured {len(collected_urls)} script request(s), {len(inline_blocks)} inline block(s)"))
     return collected_urls, inline_blocks
 
@@ -704,7 +822,8 @@ def run_line_tool(name: str, cmd: list[str], timeout: int, input_text: str = Non
 
 
 def run_katana(url: str, depth: int = 2, headers: dict = None, cookies: dict = None,
-                timeout: int = 180) -> list[str]:
+                timeout: int = 180, scope_mode: str = "any", auth_mode: str = "host",
+                proxy: str = None) -> list[str]:
     """
     Shell out to the katana crawler (ProjectDiscovery) to discover JS files
     across multiple pages of the site, beyond the single page fetched by
@@ -720,11 +839,14 @@ def run_katana(url: str, depth: int = 2, headers: dict = None, cookies: dict = N
 
     cmd = ["katana", "-u", url, "-d", str(depth), "-silent", "-jc"]
 
-    # katana sends -H headers to every in-scope host, and its default scope
-    # (rdn) covers all subdomains. When credentials are supplied, restrict
-    # the crawl to the exact target host so they don't leak elsewhere.
-    if headers or cookies:
+    # katana's default field scope (rdn) covers the root domain and all its
+    # subdomains, and it sends -H headers to every in-scope host. Narrow it
+    # to the exact host for --scope host, and when credentials are supplied
+    # with --auth-scope host (so they don't leak to sibling subdomains).
+    if scope_mode == "host" or ((headers or cookies) and auth_mode == "host"):
         cmd += ["-fs", "fqdn"]
+    if proxy:
+        cmd += ["-proxy", proxy]
 
     # katana accepts repeated -H "Key: Value" for custom headers (auth, cookie, etc.)
     if headers:
@@ -755,7 +877,8 @@ def run_katana(url: str, depth: int = 2, headers: dict = None, cookies: dict = N
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_gau(domain: str, providers: list[str] = None, timeout: int = 180,
-            blacklist: str = "png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,css") -> list[str]:
+            blacklist: str = "png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,css",
+            subs: bool = True) -> list[str]:
     """
     Shell out to gau (getallurls, lc/gau) to pull every URL ever seen for a
     domain across the Wayback Machine, AlienVault OTX, CommonCrawl and
@@ -772,7 +895,11 @@ def run_gau(domain: str, providers: list[str] = None, timeout: int = 180,
         print(f"  {yellow('[WARN]')} Install with: go install github.com/lc/gau/v2/cmd/gau@latest")
         return []
 
-    cmd = ["gau", "--subs"]
+    # gau only queries public archives (not the target), so it is never sent
+    # through --proxy. --subs is dropped for --scope host.
+    cmd = ["gau"]
+    if subs:
+        cmd.append("--subs")
     if blacklist:
         cmd += ["--blacklist", blacklist]
     if providers:
@@ -794,23 +921,30 @@ def run_gau(domain: str, providers: list[str] = None, timeout: int = 180,
 
 
 def run_httpx_probe(urls: list[str], headers: dict = None, cookies: dict = None,
-                     threads: int = 50, timeout: int = 300, target_url: str = "") -> list[dict]:
+                     threads: int = 50, timeout: int = 300, target_url: str = "",
+                     auth_mode: str = "host", proxy: str = None,
+                     same_host_redirects: bool = False) -> list[dict]:
     """
     Probe URLs with httpx. Credentials (headers/cookies) are only used for
-    URLs on the exact target host; every other URL (other subdomains from
+    URLs inside the auth scope; every other URL (other subdomains from
     gau --subs, third parties) is probed in a separate run without them.
+    Callers filter `urls` by --scope beforehand; same_host_redirects stops
+    httpx from following redirects off to other (possibly out-of-scope) hosts.
     """
+    kw = {"threads": threads, "timeout": timeout, "proxy": proxy,
+          "same_host_redirects": same_host_redirects}
     if not (headers or cookies) or not target_url:
-        return _run_httpx(urls, headers, cookies, threads, timeout)
-    scope = ScopedAuth(target_url, {}, {})
+        return _run_httpx(urls, headers, cookies, **kw)
+    scope = ScopedAuth(target_url, {}, {}, mode=auth_mode)
     in_scope = [u for u in urls if scope.in_scope(u)]
     out_scope = [u for u in urls if not scope.in_scope(u)]
-    return (_run_httpx(in_scope, headers, cookies, threads, timeout)
-            + _run_httpx(out_scope, None, None, threads, timeout))
+    return (_run_httpx(in_scope, headers, cookies, **kw)
+            + _run_httpx(out_scope, None, None, **kw))
 
 
 def _run_httpx(urls: list[str], headers: dict = None, cookies: dict = None,
-               threads: int = 50, timeout: int = 300) -> list[dict]:
+               threads: int = 50, timeout: int = 300, proxy: str = None,
+               same_host_redirects: bool = False) -> list[dict]:
     """
     Shell out to httpx (ProjectDiscovery's HTTP toolkit — NOT the Python
     `httpx` library) to probe a list of URLs and report which are alive,
@@ -829,9 +963,12 @@ def _run_httpx(urls: list[str], headers: dict = None, cookies: dict = None,
         print(f"  {yellow('[WARN]')} Install with: go install github.com/projectdiscovery/httpx/cmd/httpx@latest")
         return []
 
-    cmd = ["httpx", "-silent", "-json", "-follow-redirects",
+    cmd = ["httpx", "-silent", "-json",
+           "-follow-host-redirects" if same_host_redirects else "-follow-redirects",
            "-status-code", "-title", "-content-length", "-tech-detect",
            "-threads", str(threads)]
+    if proxy:
+        cmd += ["-http-proxy", proxy]
     if headers:
         for k, v in headers.items():
             cmd += ["-H", f"{k}: {v}"]
@@ -1754,6 +1891,35 @@ def main():
         help="JWT token (Bearer prefix optional)")
     auth.add_argument("--header", action="append", metavar="KEY:VAL",
         help="Custom header (repeatable)")
+    auth.add_argument("--auth-scope", choices=("host", "domain"), default="host",
+        help="Where --cookie/--jwt/--header are sent: 'host' = exact target host only (default); "
+             "'domain' = target's registrable domain and all its subdomains")
+
+    # Network
+    net = parser.add_argument_group("Network")
+    net.add_argument("--proxy", default=None, metavar="URL",
+        help="Send all target traffic through this proxy, e.g. http://127.0.0.1:8080 (Burp) or "
+             "socks5://127.0.0.1:9050. Applies to requests, --dynamic, katana and httpx; not to "
+             "gau/OSV/semgrep, which only talk to public services")
+    net.add_argument("--insecure", "-k", action="store_true",
+        help="Skip TLS certificate verification (self-signed targets, intercepting proxies)")
+    net.add_argument("--ca-cert", default=None, metavar="PATH",
+        help="Verify TLS against this CA bundle (e.g. Burp's exported CA in PEM). "
+             "Not usable by --dynamic: Chromium needs --insecure behind an intercepting proxy")
+
+    # Scope
+    scp = parser.add_argument_group("Scope")
+    scp.add_argument("--scope", choices=Scope.MODES, default="any",
+        help="Hosts the tool may send ANY request to: 'any' (default), 'domain' = target's "
+             "registrable domain + subdomains, 'host' = exact target host only. Also narrows katana "
+             "(-fs fqdn), gau (no --subs) and httpx (same-host redirects only), and makes --dynamic "
+             "block out-of-scope browser requests")
+    scp.add_argument("--include-host", action="append", metavar="PATTERN",
+        help="Extra allowed host for --scope host/domain, glob allowed (e.g. 'cdn.example-static.com', "
+             "'*.example.net'). Repeatable")
+    scp.add_argument("--exclude-host", action="append", metavar="PATTERN",
+        help="Never send requests to this host, glob allowed (e.g. '*.google-analytics.com'). "
+             "Applies in every --scope mode and wins over --include-host. Repeatable")
 
     # Extraction
     ext = parser.add_argument_group("Extraction")
@@ -1832,16 +1998,63 @@ def main():
     # Passed as **kwargs so each tool keeps its own default unless overridden
     tool_timeout = {"timeout": args.tool_timeout} if args.tool_timeout else {}
 
+    # ── Network / scope validation ───────────────────────────────────────────
+    if not urlparse(args.url).scheme in ("http", "https") or not urlparse(args.url).hostname:
+        parser.error(f"target must be an absolute http(s) URL, got: {args.url!r}")
+    if args.proxy:
+        p = urlparse(args.proxy)
+        if p.scheme not in ("http", "https", "socks5", "socks5h", "socks4") or not p.hostname or not p.port:
+            parser.error("--proxy must look like http://HOST:PORT or socks5://HOST:PORT")
+        if p.scheme.startswith("socks"):
+            try:
+                import socks  # noqa: F401  (PySocks, needed by requests for SOCKS)
+            except ImportError:
+                parser.error('SOCKS proxies need PySocks: pip install "requests[socks]"')
+    if args.insecure and args.ca_cert:
+        parser.error("use either --insecure or --ca-cert, not both")
+    if args.ca_cert and not Path(args.ca_cert).is_file():
+        parser.error(f"--ca-cert file not found: {args.ca_cert}")
+    if args.include_host and args.scope == "any":
+        print(f"{yellow('[WARN]')} --include-host has no effect with --scope any")
+
+    scope = Scope(args.url, args.scope, args.include_host, args.exclude_host)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     session = requests.Session()
     session.headers.update(build_headers(args))
-    # Credentials go only to the target host (see ScopedAuth)
-    session.auth = ScopedAuth(args.url, build_auth_headers(args), build_cookies(args))
+    # Credentials go only to the auth scope (see ScopedAuth)
+    session.auth = ScopedAuth(args.url, build_auth_headers(args), build_cookies(args),
+                              mode=args.auth_scope)
+    session.scope = scope                       # enforced in fetch(), per redirect hop
+    if args.proxy:
+        session.proxies = {"http": args.proxy, "https": args.proxy}
+    if args.insecure:
+        session.verify = False
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    elif args.ca_cert:
+        session.verify = args.ca_cert
 
     # ── Step 1: Fetch the page ────────────────────────────────────────────────
-    print(f"\n{bold('[*]')} Target: {cyan(args.url)}\n")
+    print(f"\n{bold('[*]')} Target: {cyan(args.url)}")
+    print(f"    Scope: {scope.describe()}   Auth scope: "
+          f"{'*.' + base_domain(urlparse(args.url).hostname) if args.auth_scope == 'domain' else urlparse(args.url).hostname}")
+    if args.proxy:
+        tls = "insecure" if args.insecure else (f"CA {args.ca_cert}" if args.ca_cert else "verified")
+        print(f"    Proxy: {args.proxy}   TLS: {tls}")
+        if not (args.insecure or args.ca_cert):
+            print(f"    {yellow('[WARN]')} Intercepting proxies (Burp/ZAP) re-sign TLS: add --ca-cert "
+                  f"<proxy CA .pem> or --insecure, else HTTPS fetches will fail")
+        if args.dynamic and not args.insecure:
+            print(f"    {yellow('[WARN]')} --dynamic behind an intercepting proxy needs --insecure "
+                  f"(Chromium can't load a CA file)")
+        if args.wappalyzer:
+            print(f"    {yellow('[WARN]')} wappalyzer runs its own browser and does NOT use --proxy")
+    if args.wappalyzer and scope.restricted:
+        print(f"    {yellow('[WARN]')} wappalyzer loads the page in its own browser and does NOT honour --scope")
+    print()
     resp = fetch(args.url, session)
     if not resp:
         sys.exit(1)
@@ -1877,6 +2090,9 @@ def main():
             depth=args.katana_depth,
             headers=build_auth_headers(args),
             cookies=build_cookies(args),
+            scope_mode=args.scope,
+            auth_mode=args.auth_scope,
+            proxy=args.proxy,
             **tool_timeout,
         )
         all_ext_urls = list(dict.fromkeys(all_ext_urls + katana_js))
@@ -1885,7 +2101,12 @@ def main():
     if args.gau:
         domain = urlparse(args.url).hostname
         providers = [p.strip() for p in args.gau_providers.split(",") if p.strip()] or None
-        gau_urls = run_gau(domain, providers=providers, **tool_timeout)
+        gau_urls = run_gau(domain, providers=providers, subs=(args.scope != "host"), **tool_timeout)
+        if scope.restricted and gau_urls:
+            kept = [u for u in gau_urls if scope.allows(u)]
+            if len(kept) != len(gau_urls):
+                print(f"  {yellow('[Scope]')} Dropped {len(gau_urls) - len(kept)} out-of-scope gau URL(s)")
+            gau_urls = kept
 
         if gau_urls:
             if args.httpx_probe:
@@ -1894,6 +2115,9 @@ def main():
                     headers=build_auth_headers(args),
                     cookies=build_cookies(args),
                     target_url=args.url,
+                    auth_mode=args.auth_scope,
+                    proxy=args.proxy,
+                    same_host_redirects=scope.restricted,
                     **tool_timeout,
                 )
                 alive_path = output_dir / "gau_alive.txt"
@@ -1928,7 +2152,13 @@ def main():
             print(f"  {green('[Inline]')} {len(new)} worker/import script(s) referenced from inline blocks")
             all_ext_urls = all_ext_urls + new
 
-    print(f"{bold('[*]')} Discovered: {len(all_ext_urls)} external script(s), {len(all_inline)} inline block(s)\n")
+    # Out-of-scope scripts are listed (not fetched) so the tester can decide
+    # whether to widen the scope with --include-host.
+    out_of_scope = [u for u in all_ext_urls if not scope.allows(u)]
+    all_ext_urls = [u for u in all_ext_urls if scope.allows(u)]
+
+    print(f"{bold('[*]')} Discovered: {len(all_ext_urls)} external script(s), {len(all_inline)} inline block(s)"
+          + (f", {len(out_of_scope)} out of scope (not fetched)" if out_of_scope else "") + "\n")
 
     # Accumulate all JS text for analysis and optional merge
     all_js_text = ""
@@ -1952,6 +2182,9 @@ def main():
             if src_url in seen:
                 continue
             seen.add(src_url)
+            if not scope.allows(src_url):          # imports/workers found along the way
+                out_of_scope.append(src_url)
+                continue
 
             print(f"  {cyan('[DL]')} {src_url}")
             js_resp = fetch(src_url, session)
@@ -1999,6 +2232,12 @@ def main():
                 )
 
             time.sleep(0.15)  # polite pacing
+
+    if out_of_scope:
+        oos_path = output_dir / "out_of_scope.txt"
+        oos_path.write_text("\n".join(dict.fromkeys(out_of_scope)) + "\n", encoding="utf-8")
+        print(f"\n  {yellow('[Scope]')} {len(set(out_of_scope))} out-of-scope script URL(s) not fetched "
+              f"({scope.describe()}) -> {oos_path}")
 
     # ── Step 4: Inline script blocks ──────────────────────────────────────────
     if not args.no_inline and all_inline:
