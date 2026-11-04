@@ -3,7 +3,7 @@ instead of JS, httpx-reported dead gau URLs), CDX lookup incl. query-string
 fallback, archived copies analysed like the rest, archived source maps,
 credentials never sent to the archive, --wayback-max, report output.
 
-Uses a local stand-in for web.archive.org (cli.WAYBACK_BASE), so no network.
+Uses a local stand-in for web.archive.org (wayback.WAYBACK_BASE), so no network.
 
 Usage: python tests/suite_wayback.py   (or via pytest: tests/test_suites.py)
 """
@@ -16,6 +16,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(Path(_REPO).resolve()))
 from js_extractor import cli
+from js_extractor.discovery import wayback  # globals patched below live in this module
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -89,8 +90,8 @@ def archive_handler(path):
     return 404, ""
 
 WAYBACK, wb_log = serve(archive_handler)
-cli.WAYBACK_BASE = WAYBACK
-cli.WAYBACK_RATE = 0          # no throttling against the local stand-in
+wayback.WAYBACK_BASE = WAYBACK
+wayback.WAYBACK_RATE = 0          # no throttling against the local stand-in
 
 def run_main(argv):
     sys.argv = ["js-extractor"] + argv

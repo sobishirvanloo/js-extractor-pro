@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, _REPO)
 from js_extractor import cli
+from js_extractor.discovery import dynamic  # globals patched below live in this module
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -207,8 +208,8 @@ check("--subs" in g and "-fs" not in k, "defaults unchanged: gau --subs, katana 
 
 # ── --dynamic: proxy, TLS flag, in-browser scope blocking ────────────────────
 class PWTimeout(Exception): pass
-cli.PlaywrightTimeoutError = PWTimeout
-cli.PLAYWRIGHT_OK = True
+dynamic.PlaywrightTimeoutError = PWTimeout
+dynamic.PLAYWRIGHT_OK = True
 SEEN = {}
 class Req:
     def __init__(self, url): self.url, self.resource_type, self.headers = url, "script", {}
@@ -240,7 +241,7 @@ class PW:
         def launch(**kw): SEEN["launch"] = kw; return Browser()
         return type("P", (), {"chromium": type("C", (), {"launch": staticmethod(launch)})})()
     def __exit__(self, *a): return False
-cli.sync_playwright = lambda: PW()
+dynamic.sync_playwright = lambda: PW()
 
 args = type("A", (), {"jwt": "TOK", "header": None, "cookie": "sid=1", "proxy": PROXY, "insecure": True,
                       "scope": "host", "include_host": None, "exclude_host": None, "auth_scope": "domain"})()

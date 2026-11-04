@@ -32,7 +32,7 @@ severity and a confidence.
 import bisect
 import re
 
-from .jsparse import (IDENT_RE, brace_map, call_args_span, is_constant_expr,
+from ..jsparse import (IDENT_RE, brace_map, call_args_span, is_constant_expr,
                       scan_js_expr_span, split_top_level, strip_parens)
 
 SEVERITY_ORDER = {"high": 0, "medium": 1, "low": 2}

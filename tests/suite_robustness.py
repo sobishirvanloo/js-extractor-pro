@@ -11,6 +11,7 @@ from pathlib import Path
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, _REPO)
 from js_extractor import cli
+from js_extractor.discovery import dynamic  # globals patched below live in this module
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -63,8 +64,8 @@ check(cli.run_wappalyzer("https://t/") == [{"name": "Vue", "version": "", "categ
 
 # ── (b) --dynamic failures don't crash ───────────────────────────────────────
 class PWTimeout(Exception): pass
-cli.PlaywrightTimeoutError = PWTimeout
-cli.PLAYWRIGHT_OK = True
+dynamic.PlaywrightTimeoutError = PWTimeout
+dynamic.PLAYWRIGHT_OK = True
 
 def make_pw(goto_raises=None, idle_raises=False, launch_raises=None):
     class Page:
@@ -96,17 +97,17 @@ def make_pw(goto_raises=None, idle_raises=False, launch_raises=None):
     return (lambda: PW()), Browser
 
 args = type("A", (), {"jwt": "", "header": None, "cookie": ""})()
-cli.sync_playwright, B = make_pw(idle_raises=True)
+dynamic.sync_playwright, B = make_pw(idle_raises=True)
 urls, inl = cli.extract_dynamic("https://t/", args)
 check(urls == ["https://t/early.js", "https://t/late.js"], "dynamic: networkidle timeout → continues; late chunks captured")
 check(inl == ["var inl = 1;"], "dynamic: inline blocks stripped (dedupe with static)")
-cli.sync_playwright, B = make_pw(goto_raises=PWTimeout("load"))
+dynamic.sync_playwright, B = make_pw(goto_raises=PWTimeout("load"))
 urls, _ = cli.extract_dynamic("https://t/", args)
 check("https://t/early.js" in urls, "dynamic: load timeout → keeps what loaded")
-cli.sync_playwright, B = make_pw(goto_raises=RuntimeError("net::ERR_NAME_NOT_RESOLVED"))
+dynamic.sync_playwright, B = make_pw(goto_raises=RuntimeError("net::ERR_NAME_NOT_RESOLVED"))
 urls, _ = cli.extract_dynamic("https://t/", args)
 check(urls == ["https://t/early.js"] and B.closed, "dynamic: navigation error → no crash, browser closed")
-cli.sync_playwright, B = make_pw(launch_raises=RuntimeError("Executable doesn't exist"))
+dynamic.sync_playwright, B = make_pw(launch_raises=RuntimeError("Executable doesn't exist"))
 check(cli.extract_dynamic("https://t/", args) == ([], []), "dynamic: Chromium missing → no crash")
 
 # ── (c) param noise ──────────────────────────────────────────────────────────

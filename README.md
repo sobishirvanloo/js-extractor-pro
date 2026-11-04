@@ -359,6 +359,30 @@ js_output/
 
 ---
 
+## Project layout
+
+```
+js_extractor/
+├── cli.py               # arguments + orchestration (main / _run); re-exports the public API
+├── net.py               # fetch(), Scope, ScopedAuth, RateLimiter, sessions, proxy/TLS
+├── ui.py · output.py    # colours · beautify, save_js, results.json
+├── jsparse.py           # linear-time JS scanning helpers (no parser)
+├── report.py            # HTML report
+├── discovery/           # finding the JavaScript
+│   ├── html.py          #   <script>, preload/modulepreload, <base href>
+│   ├── dynamic.py       #   headless Chromium (Playwright)
+│   ├── imports.py       #   import/require chains, Web/Service Workers
+│   ├── chunks.py        #   webpack runtimes, Next.js/Vite manifests
+│   ├── sourcemaps.py    #   source map discovery and safe recovery
+│   └── wayback.py       #   archived copies of scripts that are gone
+├── analyzers/           # analysing it
+│   ├── dom.py           #   DOM XSS taint analysis
+│   ├── endpoints.py · params.py · secrets.py
+│   └── frameworks.py · versions.py (+ OSV.dev CVEs)
+└── integrations/
+    └── tools.py         # katana, gau, httpx, wappalyzer, retire.js, semgrep, LinkFinder
+```
+
 ## Testing
 
 ```bash
