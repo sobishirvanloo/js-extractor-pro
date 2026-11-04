@@ -169,6 +169,7 @@ python3 js_extractor/cli.py <url> [options]
 --linkfinder                 # Run LinkFinder against downloaded JS for endpoint extraction
 --linkfinder-path PATH       # Path to linkfinder.py if not on PATH
 --all-analysis                # Enable all analysis flags above
+--tool-timeout SECONDS       # Timeout per external tool run (partial katana/gau/httpx output is kept)
 ```
 
 ### Output
@@ -225,6 +226,7 @@ js_output/
 ├── gau_all.txt              # (with --gau, no probe)
 ├── gau_alive.txt            # (with --gau --httpx-probe) — "status_code  url" per line
 ├── params_wordlist.txt      # (with --params)
+├── secrets.json             # (with --secrets) unmasked values + every file:line location
 ├── cve_report.txt           # (with --cve)
 ├── retire_report.txt        # (with --retire)
 ├── semgrep_report.txt       # (with --semgrep)

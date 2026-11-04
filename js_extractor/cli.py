@@ -63,6 +63,7 @@ Output:
 
 import argparse
 import base64
+import bisect
 import hashlib
 import json
 import re
@@ -84,6 +85,7 @@ import jsbeautifier
 # Optional — only needed for --dynamic
 try:
     from playwright.sync_api import sync_playwright
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     PLAYWRIGHT_OK = True
 except ImportError:
     PLAYWRIGHT_OK = False
@@ -310,41 +312,63 @@ def extract_dynamic(url: str, args) -> tuple[list[str], list[str]]:
         for k, v in build_cookies(args).items()
     ]
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(ignore_https_errors=True)
-        if pw_cookies:
-            context.add_cookies(pw_cookies)
-        if extra_headers:
-            def add_scoped_headers(route, request):
-                if scope.in_scope(request.url):
-                    route.continue_(headers={**request.headers, **extra_headers})
-                else:
-                    route.continue_()
-            context.route("**/*", add_scoped_headers)
+    # Any failure here (Chromium not installed, navigation error, page never
+    # going network-idle, page crash) must not kill the whole run: whatever
+    # was captured so far is returned and the static results still stand.
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            try:
+                context = browser.new_context(ignore_https_errors=True)
+                if pw_cookies:
+                    context.add_cookies(pw_cookies)
+                if extra_headers:
+                    def add_scoped_headers(route, request):
+                        if scope.in_scope(request.url):
+                            route.continue_(headers={**request.headers, **extra_headers})
+                        else:
+                            route.continue_()
+                    context.route("**/*", add_scoped_headers)
 
-        page = context.new_page()
+                page = context.new_page()
 
-        # Intercept every network request
-        def on_request(request):
-            if request.resource_type == "script":
-                collected_urls.append(request.url)
+                # Intercept every network request
+                def on_request(request):
+                    if request.resource_type == "script":
+                        collected_urls.append(request.url)
 
-        page.on("request", on_request)
-        page.goto(url, wait_until="networkidle", timeout=30000)
+                page.on("request", on_request)
 
-        # Also grab inline scripts from the live DOM
-        scripts = page.evaluate("""
-            () => Array.from(document.querySelectorAll('script:not([src])'))
-                       .map(s => s.textContent)
-                       .filter(t => t.trim().length > 0)
-        """)
-        inline_blocks.extend(scripts)
+                # SPAs with polling / websockets / analytics beacons often never
+                # reach "networkidle". Wait for the load event first (hard
+                # requirement), then give networkidle a bounded best-effort window.
+                try:
+                    page.goto(url, wait_until="load", timeout=30000)
+                except PlaywrightTimeoutError:
+                    print(f"  {yellow('[WARN]')} Page 'load' event not reached in 30s — using what loaded so far")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except PlaywrightTimeoutError:
+                    print(f"  {yellow('[WARN]')} Network never went idle (polling/websockets?) — continuing")
 
-        # Wait a bit more for any late-loading chunks
-        time.sleep(2)
-        browser.close()
+                # Extra time for late lazy-loaded chunks, while the request
+                # listener is still active (the old sleep ran after collection).
+                page.wait_for_timeout(2000)
 
+                # Also grab inline scripts from the live DOM
+                scripts = page.evaluate("""
+                    () => Array.from(document.querySelectorAll('script:not([src])'))
+                               .map(s => s.textContent)
+                               .filter(t => t.trim().length > 0)
+                """)
+                inline_blocks.extend(s.strip() for s in scripts)
+            finally:
+                browser.close()
+    except Exception as e:
+        print(f"  {yellow('[WARN]')} Dynamic extraction failed ({type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''})"
+              f" — continuing with {len(collected_urls)} script(s) captured so far")
+
+    collected_urls = list(dict.fromkeys(collected_urls))
     print(cyan(f"  [Browser] Captured {len(collected_urls)} script request(s), {len(inline_blocks)} inline block(s)"))
     return collected_urls, inline_blocks
 
@@ -511,10 +535,11 @@ def analysis_dirs(output_dir: Path) -> list[Path]:
     return [d for d in dirs if d.is_dir() and any(d.iterdir())]
 
 
-def read_recovered_sources(paths: list[Path], sm_root: Path) -> tuple[str, str, int, int]:
+def read_recovered_sources(paths: list[Path], sm_root: Path) -> tuple[list, str, int]:
     """
     Read source-map-recovered files written during this run.
-    Returns (first_party_text, vendor_text, n_first_party, n_vendor).
+    Returns (first_party_files, vendor_text, n_vendor) where
+    first_party_files is a list of (path, text).
     """
     app, vendor = [], []
     for p in paths:
@@ -524,8 +549,11 @@ def read_recovered_sources(paths: list[Path], sm_root: Path) -> tuple[str, str, 
             text = p.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        (vendor if is_vendor_path(p, sm_root) else app).append(text)
-    return "\n".join(app), "\n".join(vendor), len(app), len(vendor)
+        if is_vendor_path(p, sm_root):
+            vendor.append(text)
+        else:
+            app.append((p, text))
+    return app, "\n".join(vendor), len(vendor)
 
 
 def try_recover_sourcemap(js_code: str, js_url: str, session: requests.Session, out_dir: Path,
@@ -629,6 +657,52 @@ def try_recover_sourcemap(js_code: str, js_url: str, session: requests.Session, 
 # Katana integration (optional deep crawl for additional JS files)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def run_line_tool(name: str, cmd: list[str], timeout: int, input_text: str = None):
+    """
+    Run a line-oriented CLI tool (katana, gau, httpx). On timeout the child is
+    killed but everything it already printed is kept: subprocess attaches the
+    partial output to TimeoutExpired (always as bytes), and an incomplete final
+    line is dropped. Returns (lines, returncode, stderr) or None if the tool
+    could not be started at all.
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    except Exception as e:
+        print(f"  {yellow('[WARN]')} {name} execution failed: {e}")
+        return None
+
+    try:
+        out, err = proc.communicate(input_text, timeout=timeout)
+        return [l.strip() for l in out.splitlines() if l.strip()], proc.returncode, err
+    except subprocess.TimeoutExpired as e:
+        partial = e.stdout or b""
+        try:
+            # Documented pattern: kill, then communicate() again — it returns
+            # everything the child wrote, including what was already buffered.
+            proc.kill()
+            out, _ = proc.communicate(timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as kill_err:
+            # Couldn't stop it (e.g. restricted sandbox): fall back to the
+            # output captured up to the timeout and leave the child behind.
+            print(f"  {yellow('[WARN]')} could not stop {name} (pid {proc.pid}): {kill_err}")
+            out = partial.decode("utf-8", "replace") if isinstance(partial, bytes) else partial
+    except Exception as e:
+        print(f"  {yellow('[WARN]')} {name} execution failed: {e}")
+        return None
+
+    out = out or ""
+    if out and not out.endswith("\n"):          # drop a half-written final line
+        out = out.rsplit("\n", 1)[0] if "\n" in out else ""
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    print(f"  {yellow('[WARN]')} {name} timed out after {timeout}s — keeping {len(lines)} "
+          f"partial result line(s) (raise with --tool-timeout)")
+    return lines, None, ""
+
+
 def run_katana(url: str, depth: int = 2, headers: dict = None, cookies: dict = None,
                 timeout: int = 180) -> list[str]:
     """
@@ -662,20 +736,14 @@ def run_katana(url: str, depth: int = 2, headers: dict = None, cookies: dict = N
             cmd += ["-H", f"Cookie: {cookie_str}"]
 
     print(f"  {cyan('[Katana]')} Crawling {url} (depth={depth})... this can take a while")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        print(f"  {yellow('[WARN]')} katana timed out after {timeout}s — using partial results")
+    res = run_line_tool("katana", cmd, timeout)
+    if res is None:
         return []
-    except Exception as e:
-        print(f"  {yellow('[WARN]')} katana execution failed: {e}")
-        return []
-
-    if proc.returncode not in (0, None) and not proc.stdout.strip():
-        print(f"  {yellow('[WARN]')} katana exited with code {proc.returncode}: {proc.stderr.strip()[:200]}")
+    all_urls, rc, err = res
+    if rc not in (0, None) and not all_urls:
+        print(f"  {yellow('[WARN]')} katana exited with code {rc}: {err.strip()[:200]}")
         return []
 
-    all_urls = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     # katana's plain output mixes all discovered URLs, so filter to .js ourselves
     js_urls = sorted(set(u for u in all_urls if u.split("?")[0].endswith(".js")))
     print(f"  {green('[Katana]')} Discovered {len(js_urls)} additional JS file(s) via crawl")
@@ -712,20 +780,15 @@ def run_gau(domain: str, providers: list[str] = None, timeout: int = 180,
     cmd += [domain]
 
     print(f"  {cyan('[gau]')} Pulling historical URLs for {domain} (Wayback/OTX/CommonCrawl/URLScan)...")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        print(f"  {yellow('[WARN]')} gau timed out after {timeout}s — using partial results")
+    res = run_line_tool("gau", cmd, timeout)
+    if res is None:
         return []
-    except Exception as e:
-        print(f"  {yellow('[WARN]')} gau execution failed: {e}")
-        return []
-
-    if proc.returncode not in (0, None) and not proc.stdout.strip():
-        print(f"  {yellow('[WARN]')} gau exited with code {proc.returncode}: {proc.stderr.strip()[:200]}")
+    lines, rc, err = res
+    if rc not in (0, None) and not lines:
+        print(f"  {yellow('[WARN]')} gau exited with code {rc}: {err.strip()[:200]}")
         return []
 
-    urls = sorted(set(line.strip() for line in proc.stdout.splitlines() if line.strip()))
+    urls = sorted(set(lines))
     print(f"  {green('[gau]')} Collected {len(urls)} historical URL(s)")
     return urls
 
@@ -778,22 +841,12 @@ def _run_httpx(urls: list[str], headers: dict = None, cookies: dict = None,
             cmd += ["-H", f"Cookie: {cookie_str}"]
 
     print(f"  {cyan('[httpx]')} Probing {len(urls)} URL(s) for liveness...")
-    try:
-        proc = subprocess.run(
-            cmd, input="\n".join(urls), capture_output=True, text=True, timeout=timeout
-        )
-    except subprocess.TimeoutExpired:
-        print(f"  {yellow('[WARN]')} httpx timed out after {timeout}s — using partial results")
-        return []
-    except Exception as e:
-        print(f"  {yellow('[WARN]')} httpx execution failed: {e}")
+    res = run_line_tool("httpx", cmd, timeout, input_text="\n".join(urls))
+    if res is None:
         return []
 
     results = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
+    for line in res[0]:
         try:
             results.append(json.loads(line))
         except json.JSONDecodeError:
@@ -913,6 +966,9 @@ _PARAM_NOISE = {
     "request", "options", "config", "params", "props", "state", "value",
     "type", "name", "text", "html", "body", "head", "style", "src", "href",
 }
+# Matching is case-insensitive, so normalise once (mixed-case entries like
+# "toString" / "forEach" never matched before).
+_PARAM_NOISE = {w.lower() for w in _PARAM_NOISE}
 
 def extract_params(js_code: str, html_code: str = "") -> list[str]:
     """
@@ -961,24 +1017,56 @@ def find_secrets(js_code: str) -> list[dict]:
     """
     Scan JS source for leaked credentials/tokens.
 
-    Returns list of { type, value, line } dicts.
+    Returns list of { type, value, line } dicts (line is 1-based within js_code).
     """
-    lines = js_code.split("\n")
+    # Offsets of every newline, so each match's line is a binary search
+    # instead of re-counting the whole prefix (quadratic on big bundles).
+    newlines = [i for i, ch in enumerate(js_code) if ch == "\n"]
     results = []
     seen = set()
 
     for pat, label in _SECRET_PATTERNS:
         for m in re.finditer(pat, js_code, re.IGNORECASE | re.MULTILINE):
             val = m.group(1)
-            key = (label, val[:30])
+            # Dedupe on the full value: a 30-char prefix collapsed distinct
+            # JWTs, which all share the same encoded header.
+            key = (label, val)
             if key in seen:
                 continue
             seen.add(key)
-            # Find line number
-            line_no = js_code[:m.start()].count("\n") + 1
+            line_no = bisect.bisect_left(newlines, m.start()) + 1
             results.append({"type": label, "value": val, "line": line_no})
 
     return results
+
+
+def find_secrets_in_files(files: list[tuple[str, str, int]]) -> list[dict]:
+    """
+    Run find_secrets() per file so every finding points at a real file and
+    line on disk. `files` is a list of (display_path, text, header_lines),
+    where header_lines is how many lines save_js() prepended on disk.
+
+    The same secret often appears in several places (the minified bundle AND
+    its recovered original source), so findings are grouped by (type, value):
+      { type, value, file, line, locations: [{file, line}, ...] }
+    with file/line being the first location.
+    """
+    grouped = {}
+    for path, text, offset in files:
+        for f in find_secrets(text):
+            loc = {"file": path, "line": f["line"] + offset}
+            key = (f["type"], f["value"])
+            if key not in grouped:
+                grouped[key] = {"type": f["type"], "value": f["value"], **loc, "locations": []}
+            grouped[key]["locations"].append(loc)
+    return list(grouped.values())
+
+
+def mask_secret(val: str) -> str:
+    """Show only a small prefix/suffix of a secret; never most of a short one."""
+    n = len(val)
+    head, tail = min(6, n // 4), min(4, n // 6)
+    return val[:head] + "..." + (val[-tail:] if tail else "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1139,14 +1227,27 @@ def run_wappalyzer(url: str, timeout: int = 60) -> list[dict]:
         print(f"  {yellow('[WARN]')} Could not parse wappalyzer output as JSON")
         return []
 
-    # wappalyzer CLI output shape: {"urls": {...}, "technologies": [...]}
-    techs = data.get("technologies", data if isinstance(data, list) else [])
+    # Output shape varies across wappalyzer CLI versions/forks:
+    #   {"urls": {...}, "technologies": [...]}  or a bare [...] list.
+    # Categories may be dicts ({"name": ...}) or plain strings.
+    if isinstance(data, dict):
+        techs = data.get("technologies") or []
+    elif isinstance(data, list):
+        techs = data
+    else:
+        techs = []
     results = []
     for t in techs:
+        if not isinstance(t, dict):
+            continue
+        cats = t.get("categories") or []
         results.append({
-            "name": t.get("name", "unknown"),
-            "version": t.get("version") or "",
-            "categories": [c.get("name", "") for c in t.get("categories", [])],
+            "name": str(t.get("name") or "unknown"),
+            "version": str(t.get("version") or ""),
+            "categories": [
+                str(c.get("name", "")) if isinstance(c, dict) else str(c)
+                for c in (cats if isinstance(cats, list) else [])
+            ],
         })
 
     print(f"  {green('[Wappalyzer]')} Identified {len(results)} technolog{'y' if len(results) == 1 else 'ies'}")
@@ -1350,12 +1451,17 @@ def run_linkfinder(target_dirs: list[Path], linkfinder_path: str = "", timeout: 
 # File I/O
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_js(content: str, path: Path, url: str = "") -> None:
-    """Write beautified JS to disk with an optional source comment header."""
+def save_js(content: str, path: Path, url: str = "") -> int:
+    """
+    Write beautified JS to disk with an optional source comment header.
+    Returns how many lines the header adds, so line numbers computed on
+    `content` can be mapped to the file on disk.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    header = f"/* Source: {url} */\n\n" if url else ""
+    header = f"/* Source: {url.replace('*/', '*_/')} */\n\n" if url else ""
     path.write_text(header + content, encoding="utf-8")
     print(f"  {green('[OK]')} Saved -> {path.name}")
+    return header.count("\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1433,14 +1539,15 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     # ── Secrets ──────────────────────────────────────────────────────────────
     sec_rows = ""
     for s in data.get("secrets", []):
-        # Mask the middle of the secret value
-        val = s["value"]
-        masked = val[:6] + "..." + val[-4:] if len(val) > 12 else val[:4] + "..."
+        locs = s.get("locations") or [{"file": s.get("file", ""), "line": s["line"]}]
+        loc_html = "<br>".join(f"{e(l['file'])}:{e(l['line'])}" for l in locs[:5])
+        if len(locs) > 5:
+            loc_html += f"<br><i>+{len(locs) - 5} more (see secrets.json)</i>"
         sec_rows += (
             f"<tr>"
             f"<td style='padding:5px'>{badge(s['type'], '#dc2626')}</td>"
-            f"<td style='padding:5px;font-family:monospace'>{e(masked)}</td>"
-            f"<td style='padding:5px'>Line {e(s['line'])}</td>"
+            f"<td style='padding:5px;font-family:monospace'>{e(mask_secret(s['value']))}</td>"
+            f"<td style='padding:5px;font-family:monospace;font-size:12px;word-break:break-all'>{loc_html}</td>"
             f"</tr>\n"
         )
     sec_html = (
@@ -1697,6 +1804,10 @@ def main():
         help="Run LinkFinder against downloaded JS for endpoint extraction (needs LinkFinder installed separately)")
     ana.add_argument("--linkfinder-path", default="", metavar="PATH",
         help="Path to linkfinder.py if it's not on PATH as 'linkfinder'")
+    ana.add_argument("--tool-timeout", type=int, default=None, metavar="SECONDS",
+        help="Timeout for each external tool run (katana, gau, httpx, wappalyzer, retire, semgrep, "
+             "LinkFinder per file). Default: per-tool (60-300s). On timeout, partial katana/gau/httpx "
+             "output is kept.")
     ana.add_argument("--all-analysis", action="store_true",
         help="Enable --endpoints, --params, --secrets, --cve, --wappalyzer, --retire, --semgrep, and --linkfinder together")
 
@@ -1715,6 +1826,11 @@ def main():
     if args.all_analysis:
         args.endpoints = args.params = args.secrets = args.cve = True
         args.wappalyzer = args.retire = args.semgrep = args.linkfinder = True
+
+    if args.tool_timeout is not None and args.tool_timeout <= 0:
+        parser.error("--tool-timeout must be a positive number of seconds")
+    # Passed as **kwargs so each tool keeps its own default unless overridden
+    tool_timeout = {"timeout": args.tool_timeout} if args.tool_timeout else {}
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1735,7 +1851,7 @@ def main():
     wappalyzer_techs = []
     if args.wappalyzer:
         print(f"{bold('[*]')} Tech-stack fingerprinting...")
-        wappalyzer_techs = run_wappalyzer(args.url)
+        wappalyzer_techs = run_wappalyzer(args.url, **tool_timeout)
         if wappalyzer_techs:
             for t in wappalyzer_techs:
                 cats = f" [{', '.join(t['categories'])}]" if t["categories"] else ""
@@ -1761,6 +1877,7 @@ def main():
             depth=args.katana_depth,
             headers=build_auth_headers(args),
             cookies=build_cookies(args),
+            **tool_timeout,
         )
         all_ext_urls = list(dict.fromkeys(all_ext_urls + katana_js))
 
@@ -1768,7 +1885,7 @@ def main():
     if args.gau:
         domain = urlparse(args.url).hostname
         providers = [p.strip() for p in args.gau_providers.split(",") if p.strip()] or None
-        gau_urls = run_gau(domain, providers=providers)
+        gau_urls = run_gau(domain, providers=providers, **tool_timeout)
 
         if gau_urls:
             if args.httpx_probe:
@@ -1777,6 +1894,7 @@ def main():
                     headers=build_auth_headers(args),
                     cookies=build_cookies(args),
                     target_url=args.url,
+                    **tool_timeout,
                 )
                 alive_path = output_dir / "gau_alive.txt"
                 with alive_path.open("w", encoding="utf-8") as f:
@@ -1794,6 +1912,22 @@ def main():
             print(f"  {green('[gau]')} {len(gau_js)} JS file(s) from gau results queued for extraction")
             all_ext_urls = list(dict.fromkeys(all_ext_urls + gau_js))
 
+    # Inline blocks can reference scripts too — service worker registration
+    # and inline <script type="module"> imports usually live there. Resolve
+    # against the final page URL (after redirects).
+    if not args.no_inline and all_inline:
+        page_url = resp.url or args.url
+        from_inline = []
+        for code in all_inline:
+            if not args.no_workers:
+                from_inline += find_workers(code, page_url)
+            if not args.no_imports:
+                from_inline += find_js_imports(code, page_url)
+        new = [u for u in dict.fromkeys(from_inline) if u not in all_ext_urls]
+        if new:
+            print(f"  {green('[Inline]')} {len(new)} worker/import script(s) referenced from inline blocks")
+            all_ext_urls = all_ext_urls + new
+
     print(f"{bold('[*]')} Discovered: {len(all_ext_urls)} external script(s), {len(all_inline)} inline block(s)\n")
 
     # Accumulate all JS text for analysis and optional merge
@@ -1803,6 +1937,9 @@ def main():
     workers_to_fetch = set()
     imports_to_fetch = set()
     recovered_paths = []      # source-map-recovered files written this run
+    # (path shown to the user, text, lines prepended on disk) — lets secret
+    # findings point at the real file and line instead of a concatenated blob
+    analysis_files = []
 
     # ── Step 3: Download & beautify external scripts ──────────────────────────
     if not args.no_external:
@@ -1828,7 +1965,8 @@ def main():
 
             fname = safe_filename(src_url, prefix=f"ext_{len(seen):03d}")
             fpath = ext_dir / fname
-            save_js(beautified, fpath, url=src_url)
+            header_lines = save_js(beautified, fpath, url=src_url)
+            analysis_files.append((str(fpath.relative_to(output_dir)), beautified, header_lines))
 
             size_kb = fpath.stat().st_size / 1024
             file_records.append({"kind": "external", "filename": fname,
@@ -1871,7 +2009,8 @@ def main():
             all_js_text += beautified + "\n"
             fname = f"inline_{i:03d}.js"
             fpath = inline_dir / fname
-            save_js(beautified, fpath)
+            header_lines = save_js(beautified, fpath)
+            analysis_files.append((str(fpath.relative_to(output_dir)), beautified, header_lines))
             size_kb = fpath.stat().st_size / 1024
             file_records.append({"kind": "inline", "filename": fname,
                                   "url": f"{args.url}#inline-{i}", "saved_path": str(fpath.relative_to(output_dir)),
@@ -1909,12 +2048,15 @@ def main():
     # feeds every regex pass; vendor (node_modules) code only feeds framework
     # and library-version detection, where it helps instead of adding noise.
     sm_root = (output_dir / "sourcemap_recovered").resolve()
-    sm_app_text, sm_vendor_text, n_sm_app, n_sm_vendor = read_recovered_sources(recovered_paths, sm_root)
+    sm_app_files, sm_vendor_text, n_sm_vendor = read_recovered_sources(recovered_paths, sm_root)
+    n_sm_app = len(sm_app_files)
     if n_sm_app or n_sm_vendor:
         print(f"\n{bold('[SourceMap]')} Including {n_sm_app} first-party + {n_sm_vendor} vendor "
               f"recovered source file(s) in analysis")
-    if sm_app_text:
-        all_js_text += sm_app_text + "\n"
+    out_root = output_dir.resolve()
+    for p, text in sm_app_files:
+        all_js_text += text + "\n"
+        analysis_files.append((str(p.relative_to(out_root)), text, 0))
     fingerprint_text = all_js_text + sm_vendor_text
     report_data["sourcemap_files"] = {"first_party": n_sm_app, "vendor": n_sm_vendor}
 
@@ -1963,17 +2105,25 @@ def main():
 
     # Secrets
     report_data["secrets"] = []
-    if args.secrets and all_js_text:
+    if args.secrets and analysis_files:
         print(f"\n{bold('[Secrets]')} Scanning for leaked credentials...")
-        secrets = find_secrets(all_js_text)
+        secrets = find_secrets_in_files(analysis_files)
         report_data["secrets"] = secrets
+
+        # Full, unmasked values + every location: needed to validate findings.
+        # Terminal and HTML report only ever show masked values.
+        secrets_path = output_dir / "secrets.json"
+        secrets_path.write_text(json.dumps(secrets, indent=2, ensure_ascii=False), encoding="utf-8")
+
         if secrets:
             print(f"  {red(f'[!] {len(secrets)} potential secret(s) found:')}")
             for s in secrets:
-                masked = s["value"][:6] + "..." + s["value"][-4:]
-                print(f"      {red('[' + s['type'] + ']')} {masked}  (line {s['line']})")
+                more = f" (+{len(s['locations']) - 1} more)" if len(s["locations"]) > 1 else ""
+                print(f"      {red('[' + s['type'] + ']')} {mask_secret(s['value'])}  "
+                      f"{s['file']}:{s['line']}{more}")
         else:
             print(f"  {green('No secrets detected.')}")
+        print(f"  Saved -> {secrets_path}  (unmasked — handle with care)")
 
     # Library versions + CVE matching
     report_data["libraries"] = []
@@ -2017,7 +2167,7 @@ def main():
     report_data["retire_findings"] = []
     if args.retire:
         print(f"\n{bold('[retire.js]')} Scanning downloaded JS for known-vulnerable components...")
-        retire_findings = run_retire(analysis_dirs(output_dir))
+        retire_findings = run_retire(analysis_dirs(output_dir), **tool_timeout)
         report_data["retire_findings"] = retire_findings
         if retire_findings:
             retire_path = output_dir / "retire_report.txt"
@@ -2035,7 +2185,7 @@ def main():
     report_data["semgrep_findings"] = []
     if args.semgrep:
         print(f"\n{bold('[semgrep]')} Running static analysis...")
-        semgrep_findings = run_semgrep(analysis_dirs(output_dir), configs=args.semgrep_config)
+        semgrep_findings = run_semgrep(analysis_dirs(output_dir), configs=args.semgrep_config, **tool_timeout)
         report_data["semgrep_findings"] = semgrep_findings
         if semgrep_findings:
             semgrep_path = output_dir / "semgrep_report.txt"
@@ -2050,7 +2200,8 @@ def main():
     report_data["linkfinder_endpoints"] = []
     if args.linkfinder:
         print(f"\n{bold('[LinkFinder]')} Extracting endpoints from downloaded JS...")
-        lf_endpoints = run_linkfinder(analysis_dirs(output_dir), linkfinder_path=args.linkfinder_path)
+        lf_endpoints = run_linkfinder(analysis_dirs(output_dir), linkfinder_path=args.linkfinder_path,
+                                      **tool_timeout)
         report_data["linkfinder_endpoints"] = lf_endpoints
         if lf_endpoints:
             lf_path = output_dir / "linkfinder_endpoints.txt"
