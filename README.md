@@ -34,6 +34,10 @@ scanning, framework fingerprinting, and known-CVE lookups.
 - Deep crawl via [katana](https://github.com/projectdiscovery/katana) to discover more JS across the site — `--katana`
 - Historical URL collection via [gau](https://github.com/lc/gau) (Wayback/OTX/CommonCrawl/URLScan) to surface old/forgotten JS — `--gau`
 - Alive-check gau results with [httpx](https://github.com/projectdiscovery/httpx) before extracting — `--httpx-probe`
+- **Wayback recovery** — `--wayback`: scripts that are gone today (404/410, an HTML page instead of JS, or
+  gau URLs httpx reports dead) are fetched from their newest Wayback Machine snapshot, together with their
+  archived source maps, and analysed with everything else. Old bundles often still reference endpoints the
+  current front end dropped but the backend still serves
 - API endpoint discovery — `--endpoints`: each endpoint comes with its HTTP method when the code
   shows it (`fetch` options, `axios.post`, `xhr.open("PATCH", …)`, `$.ajax({type})`, Angular
   `HttpClient`) and the file:line it came from; "hidden/internal" is flagged on whole path tokens
@@ -219,6 +223,8 @@ order). Scripts that turn out to be HTML pages (soft 404s, login redirects, WAF 
 --gau                         # Pull historical URLs via gau (Wayback/OTX/CommonCrawl/URLScan)
 --gau-providers LIST          # Comma-separated gau providers, e.g. "wayback,otx" (default: all)
 --httpx-probe                 # Probe --gau results with httpx, keep only URLs alive today
+--wayback                     # Fetch archived copies of scripts that are gone today
+--wayback-max N               # Look up at most N dead scripts (default: 50)
 --no-inline                  # Skip inline <script> blocks
 --no-external                # Skip external .js files
 --no-workers                 # Skip Web Workers / Service Workers
@@ -317,6 +323,7 @@ js-extractor https://target.com/dashboard \
 js_output/
 ├── external/                # Downloaded + beautified external .js files
 ├── inline/                  # Beautified inline <script> blocks
+├── archived/                # (with --wayback) Wayback copies of scripts that are gone today
 ├── sourcemap_recovered/     # Original sources, one folder per bundle (+ _sources.txt index)
 ├── ALL_SCRIPTS_MERGED.js    # (with --merge)
 ├── endpoints.txt            # (with --endpoints)

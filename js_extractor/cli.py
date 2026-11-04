@@ -387,6 +387,13 @@ def fetch(url: str, session: requests.Session, quiet: bool = False):
             print(f"  {yellow('[WARN]')} Proxy error fetching {url}: {e}\n"
                   f"         Is the proxy running and reachable?", file=sys.stderr)
         return None
+    except requests.exceptions.HTTPError as e:
+        # http_404 / http_410 etc. — lets callers tell "gone" from "broken"
+        code = e.response.status_code if e.response is not None else 0
+        session.fetch_error = f"http_{code}"
+        if not quiet:
+            print(f"  {yellow('[WARN]')} Could not fetch {url}: {e}", file=sys.stderr)
+        return None
     except requests.exceptions.RequestException as e:
         session.fetch_error = "error"
         if not quiet:
@@ -1069,7 +1076,8 @@ def read_recovered_sources(paths: list[Path], sm_root: Path) -> tuple[list, str,
 
 
 def try_recover_sourcemap(js_code: str, js_url: str, session: requests.Session, out_dir: Path,
-                          headers=None, guess: bool = True, written: list = None) -> int:
+                          headers=None, guess: bool = True, written: list = None,
+                          rewrite_url=None) -> int:
     """
     Recover original (pre-bundle) sources for one script.
 
@@ -1106,7 +1114,9 @@ def try_recover_sourcemap(js_code: str, js_url: str, session: requests.Session, 
             return 0
         if not guessed:
             print(f"    {cyan('[SourceMap]')} Fetching: {map_url}")
-        resp = fetch(map_url, session, quiet=guessed)
+        # rewrite_url: the map is resolved against the script's ORIGINAL URL,
+        # then mapped to where it can be fetched (e.g. its Wayback snapshot)
+        resp = fetch(rewrite_url(map_url) if rewrite_url else map_url, session, quiet=guessed)
         if not resp:
             return 0
         map_text = resp.text
@@ -1269,6 +1279,73 @@ def run_katana(url: str, depth: int = 2, headers: dict = None, cookies: dict = N
 # ══════════════════════════════════════════════════════════════════════════════
 # gau integration (historical URL collection: Wayback / OTX / CommonCrawl / URLScan)
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _is_js_url(u: str) -> bool:
+    return bool(re.search(r"\.m?js$", u.split("#")[0].split("?")[0]))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Wayback Machine: archived copies of JS that is gone today
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Old bundles (found by gau, or referenced but 404 now) often still contain
+# endpoints, params and keys that were removed from the current front end —
+# while the backend routes frequently still exist. The CDX API finds the most
+# recent 200 snapshot; /web/<ts>id_/<url> returns the original bytes without
+# the Wayback toolbar.
+
+WAYBACK_BASE = "https://web.archive.org"     # overridable (tests use a local stand-in)
+WAYBACK_RATE = 1.0                           # req/s — archive.org is a shared public service
+
+
+def make_wayback_session(max_bytes: int = 0) -> requests.Session:
+    """Plain session for archive.org: no target credentials, no target scope, no --proxy."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": "js-extractor (+https://github.com/sobishirvanloo/js-extractor-pro)"})
+    s.limiter = RateLimiter(WAYBACK_RATE)
+    s.max_bytes = max_bytes
+    s.scope = None
+    return s
+
+
+def wayback_latest_snapshot(url: str, session: requests.Session):
+    """(timestamp, original_url) of the newest 200 snapshot of `url`, or None."""
+    candidates = [url]
+    if "?" in url:                        # cache-busting query strings rarely match exactly
+        candidates.append(url.split("?", 1)[0])
+    for u in candidates:
+        q = (f"{WAYBACK_BASE}/cdx/search/cdx?url={urllib.parse.quote(u, safe='')}"
+             f"&output=json&fl=timestamp,original&filter=statuscode:200&limit=-1")
+        resp = fetch(q, session, quiet=True)
+        if resp is None:
+            continue
+        try:
+            rows = json.loads(resp.text or "[]")
+        except ValueError:
+            continue
+        # first row is the header ["timestamp", "original"]
+        rows = [r for r in rows[1:] if isinstance(r, list) and len(r) >= 2]
+        if rows:
+            return rows[-1][0], rows[-1][1]
+    return None
+
+
+def fetch_from_wayback(url: str, session: requests.Session):
+    """
+    Archived copy of a dead script. Returns
+    {url, snapshot, archive_url, text, headers} or None.
+    """
+    snap = wayback_latest_snapshot(url, session)
+    if not snap:
+        return None
+    ts, original = snap
+    archive_url = f"{WAYBACK_BASE}/web/{ts}id_/{original}"
+    resp = fetch(archive_url, session, quiet=True)
+    if resp is None or looks_like_html(resp.text):
+        return None
+    return {"url": url, "snapshot": ts, "archive_url": archive_url,
+            "text": resp.text, "headers": resp.headers}
+
 
 def run_gau(domain: str, providers: list[str] = None, timeout: int = 180,
             blacklist: str = "png,jpg,jpeg,gif,svg,woff,woff2,ttf,eot,ico,css",
@@ -2426,7 +2503,9 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     # ── Files table ──────────────────────────────────────────────────────────
     file_rows = ""
     for f in data.get("files", []):
-        kind_badge = badge(f["kind"], "#6366f1" if f["kind"] == "external" else "#0891b2")
+        kind_badge = badge(f["kind"], {"external": "#6366f1", "archived": "#a16207"}.get(f["kind"], "#0891b2"))
+        if f.get("snapshot"):
+            kind_badge += f'<br><a href="{safe_href(f.get("archive_url", ""))}" target="_blank" rel="noopener noreferrer" style="font-size:11px">snapshot {e(f["snapshot"])}</a>'
         file_rows += f"""<tr>
           <td>{kind_badge}</td>
           <td style="word-break:break-all"><a href="{e(f['saved_path'])}" target="_blank" rel="noopener noreferrer">{e(f['filename'])}</a></td>
@@ -2821,6 +2900,12 @@ def main():
         help="Skip Web Worker and Service Worker scripts")
     ext.add_argument("--no-sourcemaps", action="store_true",
         help="Skip source map recovery")
+    ext.add_argument("--wayback", action="store_true",
+        help="Fetch Wayback Machine copies of scripts that are gone today (404/410, or an HTML page "
+             "instead of JS) — mostly old bundles found by --gau — and analyse them with the rest. "
+             "Talks to web.archive.org directly (not via --proxy), ~1 request/second")
+    ext.add_argument("--wayback-max", type=int, default=50, metavar="N",
+        help="Look up at most N dead scripts in the Wayback Machine (default: 50)")
     ext.add_argument("--no-chunks", action="store_true",
         help="Skip lazy-chunk discovery (webpack runtime chunk maps, Next.js _buildManifest, "
              "Vite manifest / preload lists)")
@@ -2884,6 +2969,8 @@ def main():
         parser.error("--threads must be between 1 and 64")
     if args.rate_limit < 0 or args.max_files < 0 or args.max_size < 0:
         parser.error("--rate-limit, --max-files and --max-size must not be negative")
+    if args.wayback_max < 1:
+        parser.error("--wayback-max must be at least 1")
 
     # --json: stdout carries only the JSON document; all progress → stderr
     if args.json:
@@ -3012,6 +3099,10 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         )
         all_ext_urls = list(dict.fromkeys(all_ext_urls + katana_js))
 
+    # JS URLs known to be gone today (httpx said 404/410 or nothing) — seeds
+    # for --wayback, alongside the 404s found while downloading
+    wayback_seed = []
+
     # ── gau: historical URL collection, optionally filtered through httpx ─────
     if args.gau:
         domain = urlparse(args.url).hostname
@@ -3041,13 +3132,16 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
                         f.write(f"{r.get('status_code', '?')}  {r.get('url', '')}\n")
                 print(f"  Saved -> {alive_path}")
                 usable_urls = [r["url"] for r in alive if r.get("url")]
+                status = {r.get("url"): r.get("status_code") for r in alive}
+                wayback_seed += [u for u in gau_urls if _is_js_url(u)
+                                 and (u not in status or status[u] in (404, 410))]
             else:
                 gau_all_path = output_dir / "gau_all.txt"
                 gau_all_path.write_text("\n".join(gau_urls), encoding="utf-8")
                 print(f"  Saved -> {gau_all_path}")
                 usable_urls = gau_urls
 
-            gau_js = sorted(set(u for u in usable_urls if u.split("?")[0].endswith(".js")))
+            gau_js = sorted(set(u for u in usable_urls if _is_js_url(u)))
             print(f"  {green('[gau]')} {len(gau_js)} JS file(s) from gau results queued for extraction")
             all_ext_urls = list(dict.fromkeys(all_ext_urls + gau_js))
 
@@ -3089,6 +3183,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
     # ── Step 3: Download & beautify external scripts ──────────────────────────
     skipped = {"failed": [], "too_large": [], "not_javascript": [], "max_files": [], "guess_missed": []}
     page_url = resp.url or args.url
+    archived, wayback_stats = [], {"candidates": 0, "found": 0}
 
     # Lazy-chunk discovery state. Chunk URLs built from bundler metadata are
     # "guesses": fetched quietly, and a miss (404, or the index.html an SPA
@@ -3206,6 +3301,9 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
                             key = "guess_missed"
                         else:
                             key = res["error"] if res["error"] in skipped else "failed"
+                            # gone today (404/410, or the SPA's index.html) → try the archive
+                            if res["error"] in ("http_404", "http_410", "not_javascript"):
+                                wayback_seed.append(res["url"])
                         skipped[key].append(res["url"])
                         continue
                     if res["guess"]:
@@ -3252,6 +3350,48 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         if skipped["max_files"]:
             print(f"\n  {yellow('[Limit]')} --max-files {args.max_files} reached: "
                   f"{len(skipped['max_files'])} script(s) not downloaded")
+
+        # ── Wayback: archived copies of scripts that are gone today ───────────
+        dead = [u for u in dict.fromkeys(wayback_seed) if scope.allows(u)]
+        wayback_stats["candidates"] = len(dead)
+        if args.wayback and dead:
+            todo = dead[: args.wayback_max]
+            print(f"\n{bold('[Wayback]')} Looking up {len(todo)} dead script(s) in the Wayback Machine"
+                  + (f" (capped by --wayback-max {args.wayback_max}; {len(dead) - len(todo)} more)"
+                     if len(dead) > len(todo) else "") + "...")
+            wb = make_wayback_session(max_bytes)
+            arch_dir = output_dir / "archived"
+            for i, url in enumerate(todo, 1):
+                got = fetch_from_wayback(url, wb)
+                if not got:
+                    continue
+                print(f"  {green('[Archived]')} {url}  (snapshot {got['snapshot']})")
+                beautified = beautify(got["text"])
+                all_js_text += beautified + "\n"
+                fname = safe_filename(url, prefix=f"wb_{i:03d}")
+                fpath = arch_dir / fname
+                header_lines = save_js(beautified, fpath, url=got["archive_url"])
+                analysis_files.append((str(fpath.relative_to(output_dir)), beautified, header_lines))
+                file_records.append({"kind": "archived", "filename": fname, "url": url,
+                                     "archive_url": got["archive_url"], "snapshot": got["snapshot"],
+                                     "saved_path": str(fpath.relative_to(output_dir)),
+                                     "size_kb": fpath.stat().st_size / 1024})
+                archived.append({"url": url, "snapshot": got["snapshot"],
+                                 "archive_url": got["archive_url"],
+                                 "saved_path": str(fpath.relative_to(output_dir))})
+                # Old source maps are often archived too: resolve the map URL
+                # against the ORIGINAL script URL (urljoin on the archive URL
+                # would mangle the embedded "http://"), then fetch its snapshot.
+                if not args.no_sourcemaps:
+                    ts = got["snapshot"]
+                    try_recover_sourcemap(got["text"], url, wb, output_dir,
+                                          headers=got["headers"], written=recovered_paths,
+                                          rewrite_url=lambda u, ts=ts: f"{WAYBACK_BASE}/web/{ts}id_/{u}")
+            wayback_stats["found"] = len(archived)
+            print(f"  {green('[Wayback]')} {len(archived)}/{len(todo)} recovered from the archive -> {arch_dir}")
+        elif dead and not args.wayback:
+            print(f"\n  {cyan('[Hint]')} {len(dead)} script(s) are gone today (404 / HTML instead of JS) — "
+                  f"add --wayback to fetch archived copies")
 
     if out_of_scope:
         oos_path = output_dir / "out_of_scope.txt"
@@ -3526,6 +3666,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
             "inline_blocks": sum(1 for f in file_records if f["kind"] == "inline"),
             "sourcemap_files": report_data.get("sourcemap_files", {}),
             "chunks": chunk_stats,
+            "wayback": wayback_stats,
             "out_of_scope": len(set(out_of_scope)),
             **{f"skipped_{k}": len(v) for k, v in skipped.items()},
             "findings": hits,
@@ -3546,6 +3687,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         "semgrep_findings": report_data.get("semgrep_findings", []),
         "linkfinder_endpoints": report_data.get("linkfinder_endpoints", []),
         "routes": sorted(routes),
+        "archived": archived,
         "vite_manifest_sources": vite_sources,
         "out_of_scope": list(dict.fromkeys(out_of_scope)),
         "skipped": skipped,
