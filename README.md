@@ -51,15 +51,28 @@ scanning, framework fingerprinting, and known-CVE lookups.
   **medium** (generic `apiKey`/`secret`/`password` values, after entropy and placeholder filtering),
   **low** (public by design: Google browser keys, Stripe/Mapbox publishable keys, Sentry DSNs). JWTs are
   decoded: a Supabase `service_role` key is high, an `anon` key low. `--fail-on secrets` ignores low.
-- **DOM XSS map** — `--dom`: HTML/code/navigation sinks (`innerHTML`, `document.write`, `eval`,
-  string `setTimeout`, `location`/`window.open`, `dangerouslySetInnerHTML`, Vue `v-html`, jQuery
-  `.html()`, Angular `bypassSecurityTrust*`), `message` handlers without an origin check and
-  `postMessage(…, "*")`. Constant arguments are ignored; each finding is ranked by source→sink
-  flow (`location.hash`/`search`, `document.referrer`/`cookie`, `window.name`, …):
-  **high** = a source is in the sink's argument, directly, via a variable assigned from one just
-  before, or as `event.data` in an unchecked message handler; **medium** = dynamic code execution
-  or framework bypass without a known source; **low** = other dynamic HTML/navigation sinks.
-  Regex-based triage for DOM Invader / manual review, not proof of exploitability.
+- **DOM XSS taint analysis** — `--dom` (`js_extractor/dom.py`): a static map of where untrusted data
+  can reach a dangerous sink, for triage and for driving manual testing (e.g. DOM Invader). Not proof
+  of exploitability.
+  - **Sources**: `location.*`, `document.URL`/`referrer`/`cookie`, `window.name`, `URLSearchParams(location)`,
+    `history.state`, web storage, postMessage data, and framework routing — Vue `$route`, Next.js/React
+    Router (`router.query`, `useSearchParams`, `useParams`, `useLocation`), Angular `ActivatedRoute`.
+  - **Sinks** by kind — html (`innerHTML`, `document.write`, `insertAdjacentHTML`, `setHTMLUnsafe`, React
+    `dangerouslySetInnerHTML`, Vue `v-html`, jQuery `.html()`/`$()`/`.append()`…), code (`eval`,
+    `Function`, string/tainted `setTimeout`), script-url (`<script>.src`, `new Worker`, `import()`),
+    navigation (`location`, `window.open`, `<iframe>.src`, `<a>.href`), storage/cookie writes, Angular
+    `bypassSecurityTrust*`.
+  - **Taint tracking** through variable chains (incl. destructuring), killed by clean reassignment and
+    bounded in distance so minified name reuse doesn't create false flows; plus one level of
+    **function calls** (a function whose parameter reaches a sink, called with tainted data).
+  - **Downgrades instead of hiding**: sanitizers (`DOMPurify.sanitize`, `encodeURIComponent`, escapers,
+    numeric casts), constant URL prefixes (same-origin path → low; `//` + host → open redirect),
+    stored sources (storage/cookies) and message handlers with a strict origin check.
+  - **postMessage handlers** (inline, arrow, destructured or named) classified by origin check: none
+    (high), weak `indexOf`/`includes`/regex-style (medium), strict (not reported).
+  - Each finding has a severity, a confidence and a **trace** — e.g.
+    `location (L10) → a1 (L10) → b1 (L11) → c1 (L12) → innerHTML (L13)`. `dom_sources.json` lists
+    every source read.
 - Library version fingerprinting + CVE lookup via [OSV.dev](https://osv.dev) — `--cve`
 - Optional integrations: `wappalyzer`, `retire.js`, `semgrep`, `LinkFinder`
 - HTML analysis report generation — `--report`
@@ -334,7 +347,8 @@ js_output/
 ├── results.json             # always: all findings + stats, machine-readable
 ├── routes.txt               # (Next.js) client-side routes from _buildManifest.js
 ├── out_of_scope.txt         # (with --scope/--exclude-host) script URLs skipped as out of scope
-├── dom_sinks.json           # (with --dom) sinks ranked by severity, with file:line + code
+├── dom_sinks.json           # (with --dom) findings with severity, confidence, trace, file:line
+├── dom_sources.json         # (with --dom) every place a DOM source is read
 ├── secrets.json             # (with --secrets) unmasked values + every file:line location
 ├── cve_report.txt           # (with --cve)
 ├── retire_report.txt        # (with --retire)

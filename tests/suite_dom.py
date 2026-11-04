@@ -169,5 +169,78 @@ cli.lookup_cves = lambda libs, **kw: []          # no network in --all-analysis
 code, _ = run_main([BASE, "--all-analysis", "--rate-limit", "0", "--output-dir", str(TMP / "o4")])
 check((TMP / "o4" / "dom_sinks.json").exists(), "--all-analysis includes --dom")
 
+
+# ── taint engine: sources, multi-hop, calls, sanitizers, prefixes, handlers ──
+TAINT_JS = (Path(__file__).resolve().parent / "fixtures_dom_taint.js").read_text()
+T = {}
+for f in cli.find_dom_issues(TAINT_JS):
+    T.setdefault(f["line"], []).append(f)
+
+def tf(line, sink=None):
+    hits = [f for f in T.get(line, []) if sink is None or sink in f["sink"]]
+    return hits[0] if hits else None
+
+def expect(line, severity, msg, sink=None, flow=None, trace_has=None, kind=None):
+    f = tf(line, sink)
+    ok = f is not None and f["severity"] == severity
+    if ok and flow is not None:
+        ok = (f["flow"] or "").startswith(flow)
+    if ok and trace_has is not None:
+        ok = all(t in f.get("trace_text", "") for t in trace_has)
+    if ok and kind is not None:
+        ok = f["kind"] == kind
+    check(ok, f"L{line}: {msg} ({f and (f['severity'], f['flow'], f.get('trace_text', '')[:80])})")
+
+expect(2, "high", "Vue $route.query → innerHTML", trace_has=["Vue $route"])
+expect(4, "high", "useSearchParams() → sp → term → innerHTML (2 hops)", flow="via variable 'term'",
+       trace_has=["useSearchParams()", "sp (L4)", "term (L4)"])
+expect(6, "high", "Next router.query → location", trace_has=["router.query"])
+expect(8, "high", "Angular ActivatedRoute → location", trace_has=["Angular ActivatedRoute"])
+expect(13, "high", "3-hop chain a1 → b1 → c1 → innerHTML", trace_has=["a1 (L10)", "b1 (L11)", "c1 (L12)", "innerHTML (L13)"])
+expect(17, "low", "clean reassignment kills the taint")
+expect(19, "high", "function param sink called with location.search", flow="via call renderHtml()",
+       trace_has=["location (L20)", "renderHtml() arg 1 (L20)", "html (L19)"])
+expect(22, "high", "arrow fn param sink called with tainted variable", flow="via call showMsg()",
+       trace_has=["msg (L23)", "m (L22)"])
+check(tf(25) and tf(25)["sanitized"] and tf(25)["severity"] == "low", "DOMPurify.sanitize(source) → low, sanitized")
+check(tf(26) and tf(26)["sanitized"] and tf(26)["severity"] == "low", "sanitized value stays sanitized through a variable")
+expect(28, "low", "constant same-origin path prefix → low")
+expect(29, "medium", '"//" + source → open redirect, medium')
+expect(30, "high", "source as the whole URL → high")
+expect(32, "high", "createElement('script').src = source", kind="script-url")
+expect(33, "high", "createElement('iframe').src = referrer", kind="nav")
+expect(34, "medium", "createElement('a').href = source (needs a click)", kind="nav-click")
+expect(36, "high", "$(location.hash)", sink="jQuery $(")
+expect(37, "high", "$(…).append(location.hash)", sink="jQuery DOM insertion")
+check(tf(38) is None, "$('.btn') with a constant selector is not reported")
+expect(40, "medium", "weak origin check (indexOf) → handler medium", sink="weak origin check")
+expect(40, "medium", "eval(e.data) under a weak origin check → medium", sink="eval")
+check(not [f for f in T.get(41, []) if "origin" in f["sink"]] and tf(41)["severity"] == "low",
+      "strict origin check: no handler finding, its sink low")
+expect(42, "high", "named handler (onMsg) resolved: evt.data → innerHTML", flow="message data")
+expect(43, "high", "named handler registration without origin check", sink="without origin check")
+expect(44, "high", "destructured ({data}) handler → innerHTML", sink="innerHTML", flow="message data")
+expect(46, "medium", "localStorage.getItem → innerHTML: stored source, medium")
+expect(47, "medium", "localStorage.setItem(source)", kind="storage-write")
+expect(48, "medium", "document.cookie = … + source", kind="cookie-write")
+expect(50, "high", "new Worker(source)", kind="script-url")
+expect(51, "high", "import(source)", kind="script-url")
+check(tf(52) is None, "import() with a constant or untainted argument is not reported")
+expect(54, "high", "tainted variable passed to setTimeout", flow="via variable 'code1'")
+expect(56, "low", "Angular [innerHTML] binding: low (framework-sanitized)", kind="html-sanitized")
+inv = cli.find_dom_sources(TAINT_JS)
+cats = {s["category"] for s in inv}
+check({"url", "framework-route", "referrer", "storage"} <= cats and all(s["line"] >= 1 for s in inv),
+      f"source inventory covers url/framework-route/referrer/storage ({sorted(cats)})")
+
+# minified name reuse: a short tainted name must not reach a far-away sink
+far = "e=location.hash;" + ";x=1" * 600 + ";y.innerHTML=e;"
+check(cli.find_dom_issues(far)[0]["severity"] == "low", "short (minified) name: taint expires with distance")
+
+# results.json + report carry the new fields
+check(res.get("dom_sources") and (OUT / "dom_sources.json").exists(), "dom_sources.json + results.json dom_sources")
+check(all("confidence" in d for d in dom), "every finding has a confidence")
+check("→" in report and "confidence" in report, "report shows trace and confidence")
+
 print("\nRESULT:", "ALL PASS" if not fails else f"{len(fails)} FAILED")
 sys.exit(1 if fails else 0)

@@ -88,6 +88,14 @@ import requests
 from bs4 import BeautifulSoup
 import jsbeautifier
 
+try:
+    from js_extractor import dom as dom_analysis
+    from js_extractor import jsparse
+except ImportError:                       # run directly as `python js_extractor/cli.py`
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from js_extractor import dom as dom_analysis
+    from js_extractor import jsparse
+
 # Optional — only needed for --dynamic
 try:
     from playwright.sync_api import sync_playwright
@@ -646,67 +654,12 @@ def find_js_imports(js_code: str, base_url: str) -> list[str]:
 #   Vite: preload dependency lists ("assets/About-1a2b3c.js") and, when
 #     deployed publicly, .vite/manifest.json.
 
-def _scan_js_expr(code: str, start: int, limit: int = 2_000_000) -> str:
-    """
-    Return the JS expression starting at `start`, up to the first top-level
-    `;` `,` `}` or `)` (quote- and bracket-aware). Enough for the small,
-    machine-generated expressions in webpack runtimes.
-    """
-    depth, i, end = 0, start, min(len(code), start + limit)
-    while i < end:
-        ch = code[i]
-        if ch in "\"'`":
-            j = i + 1
-            while j < end and code[j] != ch:
-                j += 2 if code[j] == "\\" else 1
-            i = j + 1
-            continue
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            if depth == 0:
-                break
-            depth -= 1
-        elif ch in ";," and depth == 0:
-            break
-        i += 1
-    return code[start:i].strip()
-
-
-def _split_top_level(expr: str, sep: str = "+") -> list[str]:
-    parts, depth, cur, i = [], 0, [], 0
-    while i < len(expr):
-        ch = expr[i]
-        if ch in "\"'`":
-            j = i + 1
-            while j < len(expr) and expr[j] != ch:
-                j += 2 if expr[j] == "\\" else 1
-            cur.append(expr[i:j + 1]); i = j + 1
-            continue
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        if ch == sep and depth == 0:
-            parts.append("".join(cur).strip()); cur = []
-        else:
-            cur.append(ch)
-        i += 1
-    parts.append("".join(cur).strip())
-    return parts
-
-
-def _strip_parens(term: str) -> str:
-    """Remove parentheses that wrap the whole term: '((a))' -> 'a'."""
-    while term.startswith("(") and term.endswith(")"):
-        depth = 0
-        for i, ch in enumerate(term):
-            depth += ch == "("
-            depth -= ch == ")"
-            if depth == 0 and i < len(term) - 1:
-                return term                       # '(a)+(b)' — not one wrapper
-        term = term[1:-1].strip()
-    return term
+# Shared JS scanning helpers live in jsparse.py (also used by dom.py)
+_scan_js_expr = jsparse.scan_js_expr
+_split_top_level = jsparse.split_top_level
+_strip_parens = jsparse.strip_parens
+_call_args = jsparse.call_args
+_is_constant_expr = jsparse.is_constant_expr
 
 
 _JS_OBJ_ENTRY_RE = re.compile(
@@ -1885,195 +1838,12 @@ def mask_secret(val: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Analysis: DOM XSS sinks / sources / postMessage
+# Analysis: DOM XSS sinks / sources / postMessage  → js_extractor/dom.py
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# A static map for DOM XSS hunting (and for driving DOM Invader): every place
-# attacker-influenced data could reach an HTML/code/navigation sink, ranked by
-# how directly a known source flows into it. Regex-based, so it's a triage
-# list, not proof: "high" = a source appears in the sink's own argument.
 
-# (label, regex ending right where the interesting argument starts, kind, mode)
-#   mode: "rhs" = assignment value | int n = n-th call argument | "expr" = expression at match end
-_DOM_SINKS = [
-    ("innerHTML",                r'''\.(?:inner|outer)HTML\s*\+?=(?!=)\s*''', "html", "rhs"),
-    ("insertAdjacentHTML",       r'''\.insertAdjacentHTML\s*\(\s*''', "html", 1),
-    ("document.write",           r'''(?<![\w$])document\s*\.\s*write(?:ln)?\s*\(\s*''', "html", 0),
-    ("createContextualFragment", r'''\.createContextualFragment\s*\(\s*''', "html", 0),
-    ("srcdoc",                   r'''\.srcdoc\s*=(?!=)\s*''', "html", "rhs"),
-    ("dangerouslySetInnerHTML",  r'''dangerouslySetInnerHTML\s*:\s*\{\s*__html\s*:\s*''', "html", "expr"),
-    ("v-html / innerHTML prop",  r'''(?<![\w$."'])innerHTML\s*:\s*''', "html", "expr"),
-    ("jQuery .html()",           r'''\.html\(\s*(?=[^)\s])''', "html", 0),
-    ("parseHTML",                r'''\.parseHTML\s*\(\s*''', "html", 0),
-    ("eval",                     r'''(?<![\w$.])eval\s*\(\s*''', "code", 0),
-    ("Function()",               r'''(?<![\w$.])(?:new\s+)?Function\s*\(\s*(?=[^)\s])''', "code", "allargs"),
-    ("setTimeout/setInterval string", r'''(?<![\w$])set(?:Timeout|Interval)\s*\(\s*(?=["'`])''', "code", 0),
-    ("location assignment",      r'''(?<![\w$.])(?:(?:window|document|self|top|parent)\s*\.\s*)?location(?:\s*\.\s*href)?\s*=(?!=)\s*''', "nav", "rhs"),
-    ("location.assign/replace",  r'''(?<![\w$])location\s*\.\s*(?:assign|replace)\s*\(\s*''', "nav", 0),
-    ("window.open",              r'''(?<![\w$])window\s*\.\s*open\s*\(\s*''', "nav", 0),
-    ("setAttribute(dangerous)",  r'''\.setAttribute\s*\(\s*["'](?:src|href|action|formaction|srcdoc|on[a-z]+)["']\s*,\s*''', "nav", "expr"),
-    ("Angular bypassSecurityTrust", r'''bypassSecurityTrust(?:Html|Script|Style|Url|ResourceUrl)\s*\(\s*''', "framework", 0),
-]
-_DOM_SINK_RES = [(label, re.compile(rx), kind, mode) for label, rx, kind, mode in _DOM_SINKS]
-
-_DOM_SOURCE_RE = re.compile(
-    r'''(?<![\w$])(?:(?:window|document|self|top)\s*\.\s*)?location\s*\.\s*(?:hash|search|href|pathname)\b'''
-    r'''|(?<![\w$])document\s*\.\s*(?:URL|documentURI|baseURI|referrer|cookie)\b'''
-    r'''|(?<![\w$])window\s*\.\s*name\b'''
-    r'''|URLSearchParams\s*\(\s*(?:(?:window|document)\s*\.\s*)?location''')
-
-_MSG_HANDLER_RE = re.compile(
-    r'''addEventListener\s*\(\s*["']message["']\s*,\s*|(?<![\w$])onmessage\s*=(?!=)\s*''')
-_POSTMESSAGE_RE = re.compile(r'''\.postMessage\s*\(\s*''')
-_ORIGIN_CHECK_RE = re.compile(r'''\.origin\b|(?<![\w$.])origin\s*(?:[!=]==?|\.)''')
-
-_LITERAL_TERM_RE = re.compile(
-    r'''"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\$]|\\.|\$(?!\{))*`'''
-    r'''|-?\d+(?:\.\d+)?|null|undefined|true|false|!0|!1''')
-
-# `name = <expression on the same line>` — used to follow a source through one variable
-_TAINT_ASSIGN_RE = re.compile(r'''(?<![\w$.])([A-Za-z_$][\w$]{0,60})\s*=(?![=>])([^;\n]{0,500})''')
-
-MAX_DOM_FINDINGS_PER_FILE = 500
-_DOM_ARG_LIMIT = 5000             # keeps hostile unterminated input linear
-_DOM_NEARBY_LINES = 15
-_DOM_TAINT_WINDOW = 3000          # chars: bounds the look-back on huge minified lines
-
-
-def _is_constant_expr(expr: str) -> bool:
-    """True if the expression is only string/number literals (concatenated)."""
-    expr = _strip_parens(expr.strip())
-    if not expr:
-        return True
-    return all(_LITERAL_TERM_RE.fullmatch(_strip_parens(t)) for t in _split_top_level(expr))
-
-
-def _call_args(code: str, start: int, limit: int = _DOM_ARG_LIMIT) -> list[str]:
-    """Arguments of a call whose '(' ends just before `start`."""
-    args, pos = [], start
-    for _ in range(16):
-        arg = _scan_js_expr(code, pos, limit)
-        args.append(arg)
-        nxt = code.find(arg, pos) + len(arg) if arg else pos
-        while nxt < len(code) and code[nxt] in " \t\r\n":
-            nxt += 1
-        if nxt >= len(code) or code[nxt] != ",":
-            break
-        pos = nxt + 1
-    return args
-
-
-def find_dom_issues(text: str) -> list[dict]:
-    """
-    Scan one file for DOM XSS sinks, postMessage issues and source→sink flow.
-    Returns [{sink, kind, severity, flow, line, snippet}] (line is 1-based in `text`).
-    """
-    newlines = [i for i, ch in enumerate(text) if ch == "\n"]
-
-    def line_of(pos):
-        return bisect.bisect_left(newlines, pos) + 1
-
-    def line_bounds(line):
-        start = newlines[line - 2] + 1 if line >= 2 else 0
-        end = newlines[line - 1] if line - 1 < len(newlines) else len(text)
-        return start, end
-
-    def snippet_at(pos):
-        """The match's line, clipped to ~240 chars around the match (minified lines can be MBs)."""
-        start, end = line_bounds(line_of(pos))
-        a, b = max(start, pos - 80), min(end, pos + 160)
-        return (("…" if a > start else "") + text[a:b].strip() + ("…" if b < end else ""))
-
-    def tainted_vars_before(pos) -> set:
-        """Variables assigned from a known source in the preceding lines (char-bounded)."""
-        line = line_of(pos)
-        first = max(1, line - _DOM_NEARBY_LINES)
-        start = max(newlines[first - 2] + 1 if first >= 2 else 0, pos - _DOM_TAINT_WINDOW)
-        names = set()
-        for a in _TAINT_ASSIGN_RE.finditer(text, start, pos):
-            if _DOM_SOURCE_RE.search(a.group(2)):
-                names.add(a.group(1))
-        return names
-
-    findings = []
-
-    def add(sink, kind, severity, flow, pos):
-        if len(findings) < MAX_DOM_FINDINGS_PER_FILE:
-            findings.append({"sink": sink, "kind": kind, "severity": severity, "flow": flow,
-                             "line": line_of(pos), "snippet": snippet_at(pos)})
-
-    # postMessage receivers first: inside a handler with no origin check,
-    # event.data is attacker-controlled, so it counts as a source for sinks there.
-    unchecked_spans = []
-    for i, m in enumerate(_MSG_HANDLER_RE.finditer(text)):
-        if i >= 200:
-            break
-        handler = _scan_js_expr(text, m.end(), 20000)
-        is_inline = "{" in handler or "=>" in handler
-        if not is_inline:
-            add("message handler (defined elsewhere)", "postmessage", "low", None, m.start())
-        elif not _ORIGIN_CHECK_RE.search(handler):
-            start = text.find(handler, m.end())
-            unchecked_spans.append((start, start + len(handler)))
-            add("message handler without origin check", "postmessage", "high",
-                "message data" if re.search(r"\.data\b", handler) else None, m.start())
-
-    def in_unchecked_handler(pos):
-        return any(a <= pos < b for a, b in unchecked_spans)
-
-    for label, rx, kind, mode in _DOM_SINK_RES:
-        for m in rx.finditer(text):
-            if len(findings) >= MAX_DOM_FINDINGS_PER_FILE:
-                break
-            if mode in ("rhs", "expr"):
-                arg = _scan_js_expr(text, m.end(), _DOM_ARG_LIMIT)
-            else:
-                args = _call_args(text, m.end())
-                arg = ", ".join(args) if mode == "allargs" else (args[mode] if len(args) > mode else "")
-            if _is_constant_expr(arg):
-                continue                                  # fixed markup / URL: not controllable
-            tainted = tainted_vars_before(m.start())
-            via = next((v for v in sorted(tainted) if re.search(r"(?<![\w$.])" + re.escape(v) + r"(?![\w$])", arg)), None)
-            if _DOM_SOURCE_RE.search(arg):
-                flow, severity = "direct", "high"
-            elif via:
-                flow, severity = f"via variable '{via}'", "high"
-            elif in_unchecked_handler(m.start()) and re.search(r"\.data\b", arg):
-                flow, severity = "message data", "high"
-            else:
-                flow = None
-                severity = "medium" if kind in ("code", "framework") else "low"
-            add(label, kind, severity, flow, m.start())
-
-    # postMessage senders targeting "*": data readable by whatever window is there
-    for i, m in enumerate(_POSTMESSAGE_RE.finditer(text)):
-        if i >= 500:
-            break
-        args = _call_args(text, m.end())
-        if len(args) >= 2 and args[1].strip() in ('"*"', "'*'", "`*`"):
-            add('postMessage(…, "*")', "postmessage", "medium", None, m.start())
-
-    order = {"high": 0, "medium": 1, "low": 2}
-    findings.sort(key=lambda f: (order[f["severity"]], f["line"]))
-    return findings
-
-
-def find_dom_issues_in_files(files: list[tuple[str, str, int]]) -> list[dict]:
-    """
-    Per-file DOM scan with real file:line locations (header_lines offset, like
-    secrets). The same sink often appears in a bundle and in its recovered
-    original source, so findings are grouped by (sink, normalised snippet).
-    """
-    grouped = {}
-    for path, text, offset in files:
-        for f in find_dom_issues(text):
-            loc = {"file": path, "line": f["line"] + offset}
-            key = (f["sink"], re.sub(r"\s+", "", f["snippet"]))
-            if key not in grouped:
-                grouped[key] = {**f, **loc, "locations": []}
-            grouped[key]["locations"].append(loc)
-    order = {"high": 0, "medium": 1, "low": 2}
-    return sorted(grouped.values(), key=lambda f: (order[f["severity"]], f["file"], f["line"]))
+find_dom_issues = dom_analysis.find_dom_issues
+find_dom_sources = dom_analysis.find_dom_sources
+find_dom_issues_in_files = dom_analysis.find_dom_issues_in_files
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2580,13 +2350,17 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     dom_rows = ""
     for d in dom_shown:
         more = f" <i>(+{len(d['locations']) - 1} more)</i>" if len(d.get("locations", [])) > 1 else ""
-        flow = f"<br><small>{e(d['flow'])} source</small>" if d.get("flow") else ""
+        meta = f"<br><small>{e(d.get('kind', ''))} · confidence {e(d.get('confidence', '?'))}</small>"
+        trace = (f"<div style='margin-top:4px;color:#0f766e'>{e(d['trace_text'])}</div>"
+                 if d.get("trace_text") else "")
+        note = f"<div style='margin-top:4px;color:#64748b'><i>{e(d['note'])}</i></div>" if d.get("note") else ""
         dom_rows += (
             f"<tr><td style='padding:5px'>{badge(d['severity'], sev_colour[d['severity']])}</td>"
-            f"<td style='padding:5px;font-size:12px'>{e(d['sink'])}{flow}</td>"
+            f"<td style='padding:5px;font-size:12px'>{e(d['sink'])}{meta}</td>"
             f"<td style='padding:5px;font-family:monospace;font-size:12px;word-break:break-all'>"
             f"{e(d['file'])}:{e(d['line'])}{more}</td>"
-            f"<td style='padding:5px;font-family:monospace;font-size:12px;word-break:break-all'>{e(d['snippet'])}</td></tr>\n"
+            f"<td style='padding:5px;font-family:monospace;font-size:12px;word-break:break-all'>{e(d['snippet'])}"
+            f"{trace}{note}</td></tr>\n"
         )
     n_low = sum(1 for d in dom_all if d["severity"] == "low")
     if dom_rows:
@@ -3539,21 +3313,33 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
 
     # DOM XSS sinks / sources / postMessage
     report_data["dom_findings"] = []
+    report_data["dom_sources"] = []
     if args.dom and analysis_files:
-        print(f"\n{bold('[DOM]')} Mapping DOM XSS sinks, sources and postMessage handlers...")
-        dom = find_dom_issues_in_files(analysis_files)
+        print(f"\n{bold('[DOM]')} Taint analysis: sources → sinks, postMessage handlers...")
+        dom, dom_sources = find_dom_issues_in_files(analysis_files)
         report_data["dom_findings"] = dom
+        report_data["dom_sources"] = dom_sources
         dom_path = output_dir / "dom_sinks.json"
         dom_path.write_text(json.dumps(dom, indent=2, ensure_ascii=False), encoding="utf-8")
+        src_path = output_dir / "dom_sources.json"
+        src_path.write_text(json.dumps(dom_sources, indent=2, ensure_ascii=False), encoding="utf-8")
         counts = {s: sum(1 for d in dom if d["severity"] == s) for s in ("high", "medium", "low")}
+        flows = sum(1 for d in dom if d.get("trace"))
         print(f"  {red(str(counts['high']) + ' high')}, {yellow(str(counts['medium']) + ' medium')}, "
-              f"{counts['low']} low")
+              f"{counts['low']} low  —  {flows} with a traced source→sink flow, "
+              f"{len(dom_sources)} source read(s) inventoried")
         for d in [d for d in dom if d["severity"] != "low"][:15]:
-            flow = f" [{d['flow']} source]" if d["flow"] else ""
             colour = red if d["severity"] == "high" else yellow
-            print(f"    {colour('[' + d['severity'] + ']')} {d['sink']}{flow}  {d['file']}:{d['line']}")
-            print(f"        {d['snippet'][:140]}")
+            print(f"    {colour('[' + d['severity'] + ']')} {d['sink']}  ({d['kind']}, confidence {d['confidence']})"
+                  f"  {d['file']}:{d['line']}")
+            if d.get("trace_text"):
+                print(f"        {d['trace_text'][:160]}")
+            else:
+                print(f"        {d['snippet'][:140]}")
+            if d.get("note"):
+                print(f"        note: {d['note']}")
         print(f"  Saved -> {dom_path}")
+        print(f"  Saved -> {src_path}")
 
     # Library versions + CVE matching
     report_data["libraries"] = []
@@ -3681,6 +3467,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         "params": report_data.get("params", []),
         "secrets": report_data.get("secrets", []),          # unmasked, like secrets.json
         "dom_findings": report_data.get("dom_findings", []),
+        "dom_sources": report_data.get("dom_sources", []),
         "libraries": report_data.get("libraries", []),
         "cves": report_data.get("cves", []),
         "retire_findings": report_data.get("retire_findings", []),
