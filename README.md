@@ -19,7 +19,13 @@ scanning, framework fingerprinting, and known-CVE lookups.
 
 - Static extraction (`requests` + BeautifulSoup)
 - Dynamic extraction via headless Chromium (Playwright) — `--dynamic`
-- Follows JS imports/chunks referenced inside script files
+- Follows JS imports/chunks referenced inside script files, plus `<link rel="modulepreload">` / `preload as=script`
+- **Lazy chunk discovery**: downloads the route-split chunks an SPA only loads on navigation, which no
+  `<script>` tag references:
+  - webpack 4/5 (CRA, Angular CLI, Vue CLI, Next.js): rebuilds chunk URLs from the runtime's chunk-URL
+    function, its `{id: hash}` maps and public path, including runtimes inlined into the HTML
+  - Next.js: finds `_buildManifest.js` from the `buildId` and recovers every page route (`routes.txt`)
+  - Vite: preload dependency lists and a publicly deployed `.vite/manifest.json`
 - Parses source maps (`.js.map`) to recover original pre-bundle code — found via the
   `sourceMappingURL` comment, the `SourceMap`/`X-SourceMap` header, or by probing `<script>.map`
   (no extra dependency; uses the stdlib `json` parser)
@@ -199,6 +205,7 @@ order). Scripts that turn out to be HTML pages (soft 404s, login redirects, WAF 
 --no-workers                 # Skip Web Workers / Service Workers
 --no-sourcemaps              # Skip source map recovery (incl. probing <script>.map)
 --no-imports                 # Skip following import/require chains
+--no-chunks                  # Skip lazy-chunk discovery (webpack/Next.js/Vite)
 ```
 
 ### Analysis
@@ -298,6 +305,7 @@ js_output/
 ├── gau_alive.txt            # (with --gau --httpx-probe) — "status_code  url" per line
 ├── params_wordlist.txt      # (with --params)
 ├── results.json             # always: all findings + stats, machine-readable
+├── routes.txt               # (Next.js) client-side routes from _buildManifest.js
 ├── out_of_scope.txt         # (with --scope/--exclude-host) script URLs skipped as out of scope
 ├── secrets.json             # (with --secrets) unmasked values + every file:line location
 ├── cve_report.txt           # (with --cve)

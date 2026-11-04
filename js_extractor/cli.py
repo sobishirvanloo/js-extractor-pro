@@ -457,6 +457,11 @@ def extract_from_html(html: str, base_url: str):
     soup = BeautifulSoup(html, "html.parser")
     external_srcs, inline_blocks = [], []
 
+    # <base href> changes how every relative URL on the page resolves
+    base_tag = soup.find("base", href=True)
+    if base_tag:
+        base_url = resolve(base_tag["href"], base_url) or base_url
+
     for tag in soup.find_all("script"):
         src = tag.get("src")
         if src:
@@ -468,7 +473,17 @@ def extract_from_html(html: str, base_url: str):
             if code and code.strip():
                 inline_blocks.append(code.strip())
 
-    return external_srcs, inline_blocks
+    # Scripts the page only preloads (Vite emits modulepreload for every
+    # chunk of the entry; Next/webpack use preload/prefetch as=script).
+    for tag in soup.find_all("link", href=True):
+        rel = {r.lower() for r in (tag.get("rel") or [])}
+        is_script = (tag.get("as") or "").lower() == "script"
+        if "modulepreload" in rel or (is_script and rel & {"preload", "prefetch"}):
+            url = resolve(tag["href"], base_url)
+            if url:
+                external_srcs.append(url)
+
+    return list(dict.fromkeys(external_srcs)), inline_blocks
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -589,9 +604,11 @@ def extract_dynamic(url: str, args) -> tuple[list[str], list[str]]:
 # Import/require chain follower
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Matches: import x from './chunk.js'  |  require('./util.js')  |  import('./lazy.js')
+# Matches: import x from './chunk.js' | import x from "/assets/a.js" |
+#          require('../util.js') | import('./lazy.mjs') | export * from './b.js'
 _IMPORT_RE = re.compile(
-    r'''(?:import\s+.*?from\s+|require\s*\(\s*|import\s*\(\s*)['"`](\.{1,2}/[^'"`\s]+\.js(?:\?[^'"`\s]*)?)['"`]''',
+    r'''(?:import\s+[^;'"`]*?from\s*|export\s+[^;'"`]*?from\s*|import\s+|require\s*\(\s*|import\s*\(\s*)'''
+    r'''['"`]((?:\.{1,2})?/[^'"`\s]+\.m?js(?:\?[^'"`\s]*)?)['"`]''',
     re.MULTILINE,
 )
 
@@ -603,6 +620,288 @@ def find_js_imports(js_code: str, base_url: str) -> list[str]:
         if resolved:
             found.append(resolved)
     return found
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Lazy chunk discovery (webpack / Next.js / Vite)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Bundlers split SPAs into dozens or hundreds of lazily loaded chunks that no
+# <script> tag ever references — they are requested only when the user
+# navigates to the matching route. Their URLs are, however, fully described
+# by data inside the shipped JS:
+#   webpack 4/5 (CRA, Angular CLI, Next, Vue CLI, ...): a runtime function
+#     (`__webpack_require__.u` / `jsonpScriptSrc`) that builds a chunk URL
+#     from the chunk id plus {id: name} / {id: contenthash} maps, prefixed
+#     by the public path (`__webpack_require__.p`).
+#   Next.js: _buildManifest.js maps every page route to its chunks.
+#   Vite: preload dependency lists ("assets/About-1a2b3c.js") and, when
+#     deployed publicly, .vite/manifest.json.
+
+def _scan_js_expr(code: str, start: int, limit: int = 2_000_000) -> str:
+    """
+    Return the JS expression starting at `start`, up to the first top-level
+    `;` `,` `}` or `)` (quote- and bracket-aware). Enough for the small,
+    machine-generated expressions in webpack runtimes.
+    """
+    depth, i, end = 0, start, min(len(code), start + limit)
+    while i < end:
+        ch = code[i]
+        if ch in "\"'`":
+            j = i + 1
+            while j < end and code[j] != ch:
+                j += 2 if code[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch in ";," and depth == 0:
+            break
+        i += 1
+    return code[start:i].strip()
+
+
+def _split_top_level(expr: str, sep: str = "+") -> list[str]:
+    parts, depth, cur, i = [], 0, [], 0
+    while i < len(expr):
+        ch = expr[i]
+        if ch in "\"'`":
+            j = i + 1
+            while j < len(expr) and expr[j] != ch:
+                j += 2 if expr[j] == "\\" else 1
+            cur.append(expr[i:j + 1]); i = j + 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == sep and depth == 0:
+            parts.append("".join(cur).strip()); cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    parts.append("".join(cur).strip())
+    return parts
+
+
+def _strip_parens(term: str) -> str:
+    """Remove parentheses that wrap the whole term: '((a))' -> 'a'."""
+    while term.startswith("(") and term.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(term):
+            depth += ch == "("
+            depth -= ch == ")"
+            if depth == 0 and i < len(term) - 1:
+                return term                       # '(a)+(b)' — not one wrapper
+        term = term[1:-1].strip()
+    return term
+
+
+_JS_OBJ_ENTRY_RE = re.compile(
+    r'''(?:(\d+)|"([^"]*)"|'([^']*)'|([A-Za-z_$][\w$]*))\s*:\s*(?:"([^"]*)"|'([^']*)')''')
+
+
+def _parse_js_map(obj: str) -> dict:
+    """Parse a flat {key: "string"} object literal as emitted by webpack."""
+    out = {}
+    for m in _JS_OBJ_ENTRY_RE.finditer(obj):
+        key = next(g for g in m.groups()[:4] if g is not None)
+        out[key] = m.group(5) if m.group(5) is not None else m.group(6)
+    return out
+
+
+class ChunkTemplate:
+    """
+    A webpack chunk-URL function compiled to a list of parts:
+      ("lit", s) | ("id",) | ("p",) | ("map", {id: s}, fallback_to_id)
+    """
+
+    def __init__(self, parts, public_path, has_p, script_url, fixed=None):
+        self.parts, self.public_path, self.has_p, self.script_url = parts, public_path, has_p, script_url
+        self.fixed = fixed or {}        # id -> literal path, from `ID===e?"path":...` ternaries
+
+    @property
+    def known_ids(self) -> set:
+        """Ids enumerated by a map without fallback (the contenthash map lists every chunk)."""
+        ids = set(self.fixed)
+        for p in self.parts:
+            if p[0] == "map" and not p[2]:
+                ids |= set(p[1])
+        return ids
+
+    def _absolute(self, path: str, page_url: str, prefixed: bool):
+        if not prefixed:
+            path = (self.public_path or "") + path
+        # publicPath "" (webpack 4 default) is relative to the page; an
+        # unknown/"auto" publicPath (webpack 5) is relative to the runtime script
+        base = page_url if self.public_path == "" else self.script_url
+        return resolve(path, base)
+
+    def url_for(self, chunk_id: str, page_url: str):
+        if chunk_id in self.fixed:
+            return self._absolute(self.fixed[chunk_id], page_url, False)
+        out = []
+        for p in self.parts:
+            if p[0] == "lit":
+                out.append(p[1])
+            elif p[0] == "id":
+                out.append(chunk_id)
+            elif p[0] == "p":
+                out.append(self.public_path or "")
+            else:                                   # map lookup
+                val = p[1].get(chunk_id)
+                if val is None:
+                    if not p[2]:
+                        return None                 # no hash for this id → not a chunk
+                    val = chunk_id
+                out.append(val)
+        return self._absolute("".join(out), page_url, self.has_p)
+
+
+_CHUNK_FN_RES = [
+    # webpack 5:  r.u = e => "static/js/" + e + ".js"   |   r.u = function(e){ return ... }
+    # (minifiers drop the space: `return"static/js/"+e`)
+    # The (?<![\w$]) anchor matters: without it `[\w$]+` is retried from every
+    # position inside long identifiers/strings → O(n²) on multi-MB bundles.
+    re.compile(r'''(?<![\w$])([\w$]{1,64})\.u\s*=\s*(?:function\s*\(\s*([\w$]+)\s*\)\s*\{\s*return(?![\w$])\s*'''
+               r'''|\(?\s*([\w$]+)\s*\)?\s*=>\s*(?:\{\s*return(?![\w$])\s*|\(?))'''),
+    # webpack 4:  function jsonpScriptSrc(chunkId) { return __webpack_require__.p + ... }
+    re.compile(r'''function\s+jsonpScriptSrc\s*\(\s*([\w$]+)\s*\)\s*\{\s*return(?![\w$])\s*()'''),
+]
+_CHUNK_ID_RE = re.compile(r'''(?<![\w$])[\w$]{1,40}\.e\(\s*(\d+|"[^"\\]{1,200}"|'[^'\\]{1,200}')\s*\)''')
+
+
+MAX_CHUNK_FN_CANDIDATES = 10     # a real bundle has 1-2 runtimes; bounds hostile input
+
+
+def find_chunk_templates(js_code: str, script_url: str) -> list[ChunkTemplate]:
+    """Compile every webpack chunk-URL function found in this script."""
+    templates, tried, public_paths = [], 0, {}
+    for rx in _CHUNK_FN_RES:
+        for m in rx.finditer(js_code):
+            tried += 1
+            if tried > MAX_CHUNK_FN_CANDIDATES:
+                return templates
+            if rx is _CHUNK_FN_RES[0]:
+                obj, param = m.group(1), m.group(2) or m.group(3)
+            else:
+                obj, param = "__webpack_require__", m.group(1)
+            if not param:
+                continue
+            # Ternary chains need the whole `a ? b : c` — scan with ':' and '?'
+            # allowed, then peel off `ID===e?"literal":` (or `e===ID?...`) prefixes.
+            expr = _scan_js_expr(js_code, m.end())
+            fixed, p = {}, re.escape(param)
+            tern = re.compile(r'''\s*(?:(\d+|"[^"]*"|'[^']*')\s*===?\s*''' + p + r'''|''' + p
+                              + r'''\s*===?\s*(\d+|"[^"]*"|'[^']*'))\s*\?\s*("[^"]*"|'[^']*')\s*:\s*''')
+            while True:
+                t = tern.match(expr)
+                if not t:
+                    break
+                fixed[(t.group(1) or t.group(2)).strip("\"'")] = t.group(3)[1:-1]
+                expr = expr[t.end():]
+            parts, has_p = [], False
+            for term in _split_top_level(expr):
+                term = _strip_parens(term)
+                lit = re.fullmatch(r'''"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)\'''', term)
+                if lit:
+                    parts.append(("lit", lit.group(1) if lit.group(1) is not None else lit.group(2)))
+                elif term == param:
+                    parts.append(("id",))
+                elif re.fullmatch(r"[\w$]+\.p", term):
+                    parts.append(("p",)); has_p = True
+                else:
+                    lk = re.fullmatch(r"\(?\s*(\{.*\})\s*\)?\s*\[\s*" + re.escape(param)
+                                      + r"\s*\]\s*(\|\|\s*" + re.escape(param) + r")?", term, re.S)
+                    if not lk:
+                        parts = None
+                        break                       # unsupported construct — skip this fn
+                    parts.append(("map", _parse_js_map(lk.group(1)), bool(lk.group(2))))
+            if not parts or not any(p[0] == "lit" and re.search(r"\.m?js(\?|$)", p[1]) for p in parts):
+                continue                            # not a JS chunk-URL builder
+            # Public path: `<obj>.p = "..."` in the same runtime (one scan per object name)
+            if obj not in public_paths:
+                pm = re.search(r'(?<![\w$])' + re.escape(obj) + r'''\.p\s*=\s*(["'])([^"'\n]{0,500})\1''', js_code)
+                public_paths[obj] = pm.group(2) if pm else None
+            public_path = public_paths[obj]
+            templates.append(ChunkTemplate(parts, public_path, has_p, script_url, fixed))
+    return templates
+
+
+def find_chunk_ids(js_code: str) -> set:
+    """Chunk ids from `__webpack_require__.e(id)` calls (`n.e(42)` minified)."""
+    return {m.group(1).strip("\"'") for m in _CHUNK_ID_RE.finditer(js_code)}
+
+
+# Vite preload deps / generic bundler asset paths: "assets/About-1a2b3c.js"
+_ASSET_PATH_RE = re.compile(
+    r'''["'`]((?:\.?/)?(?:[\w\-.]+/)*(?:assets|chunks|static/js|static/chunks|js|dist|build)/'''
+    r'''[\w\-.~/@]+?\.m?js)["'`]''')
+
+
+def find_asset_paths(js_code: str, script_url: str, page_url: str) -> list[str]:
+    """
+    Script paths that bundlers keep as plain strings (Vite's __vitePreload
+    dependency arrays, chunk lists). Bare "assets/x.js" is relative to the
+    site base (Vite default base "/"); "./x.js" to the script itself.
+    """
+    out = []
+    origin_root = urljoin(page_url, "/")
+    for m in _ASSET_PATH_RE.finditer(js_code):
+        p = m.group(1)
+        base = script_url if p.startswith("./") else origin_root
+        url = resolve(p, base)
+        if url:
+            out.append(url)
+    return out
+
+
+def parse_next_build_manifest(js_code: str, manifest_url: str) -> tuple[list[str], list[str]]:
+    """
+    Next.js _buildManifest.js → (chunk URLs, page routes). Chunk paths are
+    relative to the asset prefix, i.e. everything before "/static/" in the
+    manifest URL (".../_next/").
+    """
+    if "__BUILD_MANIFEST" not in js_code:
+        return [], []
+    prefix = manifest_url.split("/static/")[0] + "/"
+    chunks = [urljoin(prefix, p) for p in re.findall(r'''["'](static/[^"']+?\.js)["']''', js_code)]
+    routes = sorted(set(re.findall(r'''["'](/[^"']*)["']\s*:\s*\[''', js_code)))
+    return list(dict.fromkeys(chunks)), routes
+
+
+def next_build_manifest_urls(html: str, script_urls: list[str], page_url: str) -> list[str]:
+    """Candidate _buildManifest.js URLs from the buildId in __NEXT_DATA__ / script paths."""
+    ids = set(re.findall(r'''"buildId"\s*:\s*"([\w\-]+)"''', html))
+    prefix = urljoin(page_url, "/_next/")
+    for u in script_urls:
+        m = re.search(r"^(.*?/_next/)static/([\w\-]+)/_(?:build|ssg)Manifest\.js", u)
+        if m:
+            ids.add(m.group(2)); prefix = m.group(1)
+        elif "/_next/static/" in u:
+            prefix = u.split("/_next/static/")[0] + "/_next/"
+    return [f"{prefix}static/{i}/_buildManifest.js" for i in sorted(ids)]
+
+
+def parse_vite_manifest(text: str, base_url: str) -> tuple[list[str], list[str]]:
+    """Vite manifest.json → (chunk URLs, original source paths)."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return [], []
+    if not isinstance(data, dict):
+        return [], []
+    files, sources = [], []
+    for src, entry in data.items():
+        if isinstance(entry, dict) and isinstance(entry.get("file"), str):
+            sources.append(src)
+            if re.search(r"\.m?js$", entry["file"]):
+                files.append(urljoin(base_url, entry["file"]))
+    return files, sources
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1901,6 +2200,18 @@ def generate_report(data: dict, out_dir: Path) -> Path:
         for lf in data.get("linkfinder_endpoints", [])
     ) or "<i>No LinkFinder results (or --linkfinder was not used)</i>"
 
+    # ── Routes (Next.js build manifest) ───────────────────────────────────────
+    route_chips = "".join(
+        f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;'
+        f'display:inline-block;word-break:break-all">{e(r)}</code>'
+        for r in data.get("routes", [])
+    ) or "<i>No client-side routes recovered</i>"
+    ch = data.get("chunks") or {}
+    if ch.get("candidates"):
+        route_chips = (f"<p>Lazy chunks: <b>{e(ch.get('found', 0))}</b> found from {e(ch['candidates'])} "
+                       f"candidate URLs ({e(ch.get('webpack_runtimes', 0))} webpack runtime(s))</p>"
+                       + route_chips)
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1950,6 +2261,7 @@ def generate_report(data: dict, out_dir: Path) -> Path:
   {section("📁 Extracted Files", files_html, "#2563eb")}
   {section("🔗 API Endpoints", ep_html, "#0891b2")}
   {section("🔗 LinkFinder Endpoints", lf_chips, "#0891b2")}
+  {section("🧭 Routes & Lazy Chunks", route_chips, "#0891b2")}
   {section("🔑 Parameters (Fuzzing Wordlist)", param_chips + wordlist_note, "#059669")}
   {section("⚠️ Potential Secrets / Credentials", sec_html, "#dc2626")}
   {section("📦 Library Versions", lib_html, "#0f766e")}
@@ -2073,6 +2385,9 @@ def main():
         help="Skip Web Worker and Service Worker scripts")
     ext.add_argument("--no-sourcemaps", action="store_true",
         help="Skip source map recovery")
+    ext.add_argument("--no-chunks", action="store_true",
+        help="Skip lazy-chunk discovery (webpack runtime chunk maps, Next.js _buildManifest, "
+             "Vite manifest / preload lists)")
     ext.add_argument("--no-imports", action="store_true",
         help="Skip following import/require chains")
 
@@ -2333,7 +2648,39 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
     analysis_files = []
 
     # ── Step 3: Download & beautify external scripts ──────────────────────────
-    skipped = {"failed": [], "too_large": [], "not_javascript": [], "max_files": []}
+    skipped = {"failed": [], "too_large": [], "not_javascript": [], "max_files": [], "guess_missed": []}
+    page_url = resp.url or args.url
+
+    # Lazy-chunk discovery state. Chunk URLs built from bundler metadata are
+    # "guesses": fetched quietly, and a miss (404, or the index.html an SPA
+    # server returns for any path) is recorded as guess_missed, not an error.
+    chunk_templates, chunk_ids, routes, vite_sources = [], set(), set(), []
+    guessed = set()
+    chunk_stats = {"webpack_runtimes": 0, "candidates": 0, "found": 0}
+
+    def add_guesses(urls):
+        new = [u for u in urls if u and u not in guessed and u not in all_ext_urls]
+        guessed.update(new)
+        return new
+
+    if not args.no_chunks and not args.no_external:
+        # CRA inlines the webpack runtime into index.html by default
+        if not args.no_inline:
+            for code in all_inline:
+                chunk_templates += find_chunk_templates(code, page_url)
+                chunk_ids |= find_chunk_ids(code)
+        # Next.js: _buildManifest.js from the buildId, even if not referenced
+        all_ext_urls += add_guesses(next_build_manifest_urls(base_html, all_ext_urls, page_url))
+        # Vite: build manifest, if it was deployed publicly
+        for mpath in ("/.vite/manifest.json", "/manifest.json"):
+            mresp = fetch(urljoin(page_url, mpath), session, quiet=True)
+            if mresp is not None and not looks_like_html(mresp.text):
+                files, sources = parse_vite_manifest(mresp.text, urljoin(page_url, "/"))
+                if files:
+                    print(f"  {green('[Chunks]')} Vite manifest {mpath}: {len(files)} chunk(s), "
+                          f"{len(sources)} source path(s)")
+                    vite_sources += sources
+                    all_ext_urls += [u for u in files if u not in all_ext_urls]
 
     if not args.no_external:
         ext_dir = output_dir / "external"
@@ -2345,33 +2692,56 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
                 local.session = make_session(args, scope, limiter, max_bytes, target_cookies)
             return local.session
 
-        def download(idx: int, src_url: str) -> dict:
+        def download(idx: int, src_url: str, is_guess: bool) -> dict:
             """Network + CPU part, run in worker threads. No shared state touched."""
             s = thread_session()
-            print(f"  {cyan('[DL]')} {src_url}")
-            js_resp = fetch(src_url, s)
+            if not is_guess:
+                print(f"  {cyan('[DL]')} {src_url}")
+            js_resp = fetch(src_url, s, quiet=is_guess)
             if not js_resp:
-                return {"idx": idx, "url": src_url, "error": s.fetch_error or "error"}
+                return {"idx": idx, "url": src_url, "guess": is_guess, "error": s.fetch_error or "error"}
             raw = js_resp.text
             if looks_like_html(raw):
-                print(f"  {yellow('[SKIP]')} {src_url} returned an HTML page, not JS (soft 404 / login / WAF?)")
-                return {"idx": idx, "url": src_url, "error": "not_javascript"}
+                if not is_guess:
+                    print(f"  {yellow('[SKIP]')} {src_url} returned an HTML page, not JS (soft 404 / login / WAF?)")
+                return {"idx": idx, "url": src_url, "guess": is_guess, "error": "not_javascript"}
+            if is_guess:
+                print(f"  {green('[Chunk]')} {src_url}")
             recovered = []
             if not args.no_sourcemaps:
                 try_recover_sourcemap(raw, src_url, s, output_dir,
                                       headers=js_resp.headers, written=recovered)
+            chunks = {}
+            if not args.no_chunks:
+                next_chunks, next_routes = parse_next_build_manifest(raw, src_url)
+                chunks = {
+                    "templates": find_chunk_templates(raw, src_url),
+                    "ids": find_chunk_ids(raw),
+                    "urls": find_asset_paths(raw, src_url, page_url) + next_chunks,
+                    "routes": next_routes,
+                }
             return {
-                "idx": idx, "url": src_url, "error": None,
+                "idx": idx, "url": src_url, "guess": is_guess, "error": None,
                 "beautified": beautify(raw),
                 "recovered": recovered,
                 "imports": [] if args.no_imports else find_js_imports(raw, src_url),
                 "workers": [] if args.no_workers else find_workers(raw, src_url),
+                "chunks": chunks,
             }
+
+        def chunk_candidates() -> list:
+            """Every chunk URL the known runtimes can build from all ids seen so far."""
+            urls = []
+            for t in chunk_templates:
+                for cid in sorted(t.known_ids | chunk_ids):
+                    urls.append(t.url_for(cid, page_url))
+            return add_guesses(u for u in urls if u not in seen)
 
         # Breadth-first in waves: each wave downloads in parallel, then results
         # are handled in submission order, so file numbering and analysis
         # output are identical from run to run regardless of thread timing.
         seen, pending, n_queued = set(), list(all_ext_urls), 0
+        pending += chunk_candidates()                  # from an inline runtime
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
             while pending:
                 wave = []
@@ -2385,17 +2755,28 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
                         skipped["max_files"].append(u)
                     else:
                         n_queued += 1
-                        wave.append((n_queued, u))
+                        wave.append((n_queued, u, u in guessed))
                 pending = []
 
-                for res in pool.map(lambda iu: download(*iu), wave):
+                for res in pool.map(lambda w: download(*w), wave):
                     if res["error"] == "out_of_scope":   # redirected out of scope
                         out_of_scope.append(res["url"])
                         continue
                     if res["error"]:
-                        key = res["error"] if res["error"] in skipped else "failed"
+                        if res["guess"] and res["error"] != "too_large":
+                            key = "guess_missed"
+                        else:
+                            key = res["error"] if res["error"] in skipped else "failed"
                         skipped[key].append(res["url"])
                         continue
+                    if res["guess"]:
+                        chunk_stats["found"] += 1
+                    ch = res["chunks"]
+                    if ch:
+                        chunk_templates.extend(ch["templates"])
+                        chunk_ids.update(ch["ids"])
+                        routes.update(ch["routes"])
+                        pending += add_guesses(u for u in ch["urls"] if u not in seen)
                     src_url, beautified = res["url"], res["beautified"]
                     all_js_text += beautified + "\n"
                     fname = safe_filename(src_url, prefix=f"ext_{res['idx']:03d}")
@@ -2413,6 +2794,21 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
                         f"\n\n{'='*70}\n// FILE: {fname}\n// SOURCE: {src_url}\n{'='*70}\n\n"
                         + beautified
                     )
+
+                # New runtimes/ids from this wave → more chunk URLs for the next
+                if not args.no_chunks:
+                    pending += chunk_candidates()
+
+        chunk_stats["webpack_runtimes"] = len(chunk_templates)
+        chunk_stats["candidates"] = len(guessed)
+        if guessed:
+            print(f"\n  {green('[Chunks]')} {chunk_stats['found']} lazy chunk(s) found from "
+                  f"{len(guessed)} candidate URL(s) ({len(chunk_templates)} webpack runtime(s), "
+                  f"{len(routes)} route(s))")
+        if routes:
+            routes_path = output_dir / "routes.txt"
+            routes_path.write_text("\n".join(sorted(routes)) + "\n", encoding="utf-8")
+            print(f"  Routes -> {routes_path}")
 
         if skipped["max_files"]:
             print(f"\n  {yellow('[Limit]')} --max-files {args.max_files} reached: "
@@ -2483,6 +2879,8 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         analysis_files.append((str(p.relative_to(out_root)), text, 0))
     fingerprint_text = all_js_text + sm_vendor_text
     report_data["sourcemap_files"] = {"first_party": n_sm_app, "vendor": n_sm_vendor}
+    report_data["routes"] = sorted(routes)
+    report_data["chunks"] = chunk_stats
 
     # Framework detection (always runs if we have JS)
     frameworks = detect_frameworks(fingerprint_text) if fingerprint_text else []
@@ -2657,6 +3055,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
             "external_downloaded": sum(1 for f in file_records if f["kind"] == "external"),
             "inline_blocks": sum(1 for f in file_records if f["kind"] == "inline"),
             "sourcemap_files": report_data.get("sourcemap_files", {}),
+            "chunks": chunk_stats,
             "out_of_scope": len(set(out_of_scope)),
             **{f"skipped_{k}": len(v) for k, v in skipped.items()},
             "findings": hits,
@@ -2674,6 +3073,8 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         "retire_findings": report_data.get("retire_findings", []),
         "semgrep_findings": report_data.get("semgrep_findings", []),
         "linkfinder_endpoints": report_data.get("linkfinder_endpoints", []),
+        "routes": sorted(routes),
+        "vite_manifest_sources": vite_sources,
         "out_of_scope": list(dict.fromkeys(out_of_scope)),
         "skipped": skipped,
     }
@@ -2686,9 +3087,10 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
     print(f"\n{'─'*55}")
     print(f"{green('[+]')} Done in {results['stats']['elapsed_seconds']:.1f}s — "
           f"{len(js_files)} JS file(s), {total_kb:.1f} KB total")
-    n_skipped = sum(len(v) for v in skipped.values())
-    if n_skipped:
-        print(f"    Skipped: " + ", ".join(f"{len(v)} {k.replace('_', ' ')}" for k, v in skipped.items() if v)
+    # guess_missed is expected (most guessed chunk URLs are probes), not a problem
+    real_skips = {k: v for k, v in skipped.items() if v and k != "guess_missed"}
+    if real_skips:
+        print(f"    Skipped: " + ", ".join(f"{len(v)} {k.replace('_', ' ')}" for k, v in real_skips.items())
               + "  (see results.json)")
     print(f"    Output dir: {output_dir.resolve()}")
     print(f"    Results:    {results_path}")
