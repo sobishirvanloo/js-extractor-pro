@@ -73,6 +73,7 @@ import time
 import urllib.parse
 from collections import defaultdict
 from datetime import datetime
+from html import escape as html_escape
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -86,13 +87,6 @@ try:
     PLAYWRIGHT_OK = True
 except ImportError:
     PLAYWRIGHT_OK = False
-
-# Optional — only needed for source map parsing
-try:
-    import sourcemap as sourcemap_lib
-    SOURCEMAP_OK = True
-except ImportError:
-    SOURCEMAP_OK = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -117,8 +111,8 @@ def bold(t):   return _c("1",  t)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_headers(args) -> dict:
-    """Assemble request headers from CLI arguments."""
-    headers = {
+    """Generic (non-sensitive) request headers sent to every host."""
+    return {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -127,6 +121,15 @@ def build_headers(args) -> dict:
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+
+def build_auth_headers(args) -> dict:
+    """
+    User-supplied headers (--jwt and every --header). These may carry
+    credentials, so they are only ever sent to the target host — see
+    ScopedAuth.
+    """
+    headers = {}
     if args.jwt:
         token = args.jwt.strip()
         if not token.lower().startswith("bearer "):
@@ -151,14 +154,60 @@ def build_cookies(args) -> dict:
     return cookies
 
 
-def fetch(url: str, session: requests.Session):
-    """GET a URL. Returns Response or None on failure."""
+class ScopedAuth(requests.auth.AuthBase):
+    """
+    Attach the user's auth headers / cookies only to requests whose host is
+    exactly the target host (and never downgrade https -> http). Everything
+    else — CDNs, analytics, cross-origin imports, source maps, gau URLs on
+    other subdomains — is fetched without credentials.
+    """
+
+    def __init__(self, target_url: str, headers: dict, cookies: dict):
+        parsed = urlparse(target_url)
+        self.host = (parsed.hostname or "").lower()
+        self.scheme = parsed.scheme.lower()
+        self.headers = dict(headers or {})
+        self.cookie_str = "; ".join(f"{k}={v}" for k, v in (cookies or {}).items())
+
+    def in_scope(self, url: str) -> bool:
+        parsed = urlparse(url)
+        if (parsed.hostname or "").lower() != self.host:
+            return False
+        if self.scheme == "https" and parsed.scheme.lower() != "https":
+            return False
+        return True
+
+    def __call__(self, r):
+        if self.in_scope(r.url):
+            r.headers.update(self.headers)
+            if self.cookie_str:
+                existing = r.headers.get("Cookie")
+                r.headers["Cookie"] = f"{existing}; {self.cookie_str}" if existing else self.cookie_str
+        return r
+
+
+MAX_REDIRECTS = 10
+
+def fetch(url: str, session: requests.Session, quiet: bool = False):
+    """
+    GET a URL. Returns Response or None on failure.
+
+    Redirects are followed manually so that session.auth (ScopedAuth) is
+    re-evaluated for every hop; with requests' built-in redirect handling,
+    custom headers would be carried over to a redirect target on another host.
+    """
     try:
-        resp = session.get(url, timeout=20, allow_redirects=True)
-        resp.raise_for_status()
-        return resp
+        for _ in range(MAX_REDIRECTS + 1):
+            resp = session.get(url, timeout=20, allow_redirects=False)
+            if resp.is_redirect:
+                url = urljoin(resp.url, resp.headers["Location"])
+                continue
+            resp.raise_for_status()
+            return resp
+        raise requests.exceptions.TooManyRedirects(f"Exceeded {MAX_REDIRECTS} redirects")
     except requests.exceptions.RequestException as e:
-        print(f"  {yellow('[WARN]')} Could not fetch {url}: {e}", file=sys.stderr)
+        if not quiet:
+            print(f"  {yellow('[WARN]')} Could not fetch {url}: {e}", file=sys.stderr)
         return None
 
 
@@ -250,41 +299,29 @@ def extract_dynamic(url: str, args) -> tuple[list[str], list[str]]:
     collected_urls = []
     inline_blocks = []
 
-    # Build extra headers dict (without cookie — handled via context)
-    extra_headers = {}
-    if args.jwt:
-        token = args.jwt.strip()
-        if not token.lower().startswith("bearer "):
-            token = f"Bearer {token}"
-        extra_headers["Authorization"] = token
-    for h in args.header or []:
-        if ":" in h:
-            k, v = h.split(":", 1)
-            extra_headers[k.strip()] = v.strip()
+    # Auth headers are injected per-request (target host only) via a route
+    # handler — NOT via extra_http_headers, which would send them everywhere.
+    extra_headers = build_auth_headers(args)
+    scope = ScopedAuth(url, extra_headers, {})
 
-    # Parse cookies for Playwright
-    pw_cookies = []
-    parsed_base = urlparse(url)
-    if args.cookie:
-        for pair in args.cookie.split(";"):
-            pair = pair.strip()
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                pw_cookies.append({
-                    "name": k.strip(),
-                    "value": v.strip(),
-                    "domain": parsed_base.hostname,
-                    "path": "/",
-                })
+    # Cookies bound to the target URL are host-only (no subdomains, no 3rd parties)
+    pw_cookies = [
+        {"name": k, "value": v, "url": url}
+        for k, v in build_cookies(args).items()
+    ]
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(
-            extra_http_headers=extra_headers,
-            ignore_https_errors=True,
-        )
+        context = browser.new_context(ignore_https_errors=True)
         if pw_cookies:
             context.add_cookies(pw_cookies)
+        if extra_headers:
+            def add_scoped_headers(route, request):
+                if scope.in_scope(request.url):
+                    route.continue_(headers={**request.headers, **extra_headers})
+                else:
+                    route.continue_()
+            context.route("**/*", add_scoped_headers)
 
         page = context.new_page()
 
@@ -358,71 +395,233 @@ def find_workers(js_code: str, base_url: str) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 _SOURCEMAP_REF_RE = re.compile(
-    r'//[#@]\s*sourceMappingURL=([^\s]+)', re.MULTILINE
+    r'(?://|/\*)[#@]\s*sourceMappingURL=([^\s*]+)', re.MULTILINE
 )
 
-def try_recover_sourcemap(js_code: str, js_url: str, session: requests.Session, out_dir: Path) -> int:
+def safe_sourcemap_dest(src_file: str, sm_root: Path):
     """
-    Look for a sourceMappingURL comment in the JS.
-    If found, fetch the .map file and extract original source files.
-    Returns the number of original files recovered.
+    Map an attacker-controlled `sources` entry from a source map to a path
+    strictly inside sm_root. Drops '', '.', '..' segments (both / and \\
+    separators), sanitises each remaining segment, then verifies the resolved
+    path is still under sm_root. Returns None if no safe path can be built.
     """
-    if not SOURCEMAP_OK:
-        return 0
+    parts = [p for p in re.split(r"[\\/]+", src_file) if p not in ("", ".", "..")]
+    parts = [re.sub(r"[^\w.\-]", "_", p) for p in parts]
+    parts = [p for p in parts if p.strip(".")]   # no segments made only of dots
+    if not parts:
+        return None
+    dest = (sm_root / Path(*parts)).resolve()
+    if dest == sm_root or not dest.is_relative_to(sm_root):
+        return None
+    return dest
 
-    m = _SOURCEMAP_REF_RE.search(js_code)
-    if not m:
-        return 0
 
-    map_ref = m.group(1).strip()
+def _decode_data_uri(uri: str):
+    """Decode a data: URI (base64 or percent-encoded). Returns text or None."""
+    try:
+        meta, payload = uri[5:].split(",", 1)
+        if meta.lower().endswith(";base64"):
+            return base64.b64decode(payload + "=" * (-len(payload) % 4)).decode("utf-8", "replace")
+        return urllib.parse.unquote(payload)
+    except Exception:
+        return None
 
-    # Inline base64 source map: sourceMappingURL=data:application/json;base64,<data>
-    if map_ref.startswith("data:"):
+
+def parse_sourcemap(map_text: str) -> list[tuple[str, object]]:
+    """
+    Parse a Source Map v3 document with the stdlib json module.
+
+    Handles the XSSI prefix ( )]}' ), `sourceRoot`, and index maps
+    (`sections`, recursively). Returns a list of (source_path, content)
+    pairs — content is None when the map lists a source without embedding
+    its `sourcesContent`.
+    """
+    text = map_text.lstrip("﻿")
+    if text.startswith(")]}"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+    data = json.loads(text)
+
+    def walk(sm: dict, depth: int = 0) -> list:
+        if not isinstance(sm, dict) or depth > 5:
+            return []
+        if isinstance(sm.get("sections"), list):
+            out = []
+            for sec in sm["sections"]:
+                if isinstance(sec, dict) and isinstance(sec.get("map"), dict):
+                    out += walk(sec["map"], depth + 1)
+            return out
+        sources = sm.get("sources") or []
+        contents = sm.get("sourcesContent") or []
+        root = sm.get("sourceRoot") or ""
+        if not isinstance(root, str):
+            root = ""
+        out = []
+        for i, src in enumerate(sources):
+            if not isinstance(src, str):
+                continue
+            content = contents[i] if i < len(contents) else None
+            if root and "://" not in src and not src.startswith("/"):
+                src = root.rstrip("/") + "/" + src
+            out.append((src, content if isinstance(content, str) else None))
+        return out
+
+    return walk(data)
+
+
+def find_sourcemap_ref(js_code: str, headers=None):
+    """
+    Locate the source map reference for a script: the LAST sourceMappingURL
+    comment (bundlers append it at the end; earlier ones may belong to
+    concatenated files), else the SourceMap / X-SourceMap response header.
+    """
+    matches = _SOURCEMAP_REF_RE.findall(js_code)
+    if matches:
+        return matches[-1].strip()
+    if headers:
+        for h in ("SourceMap", "X-SourceMap"):
+            if headers.get(h):
+                return headers[h].strip()
+    return None
+
+
+# Third-party code inside recovered sources. Kept for retire.js / version
+# fingerprinting (that's where vulnerable libs live) but excluded from
+# endpoint / param / secret / semgrep / LinkFinder passes, where it is noise.
+VENDOR_DIR_NAMES = ("node_modules", "bower_components", "jspm_packages")
+
+# Text source types worth analysing among recovered files
+SOURCE_EXTENSIONS = {
+    ".js", ".mjs", ".cjs", ".jsx", ".ts", ".mts", ".cts", ".tsx",
+    ".vue", ".svelte", ".html", ".htm", ".json", ".graphql", ".gql",
+}
+
+
+def is_vendor_path(path: Path, root: Path) -> bool:
+    """True if `path` sits under a vendor dir (checked relative to root only)."""
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    return any(p in VENDOR_DIR_NAMES for p in parts)
+
+
+def analysis_dirs(output_dir: Path) -> list[Path]:
+    """Every output folder holding code worth scanning with external tools."""
+    dirs = [output_dir / "external", output_dir / "inline", output_dir / "sourcemap_recovered"]
+    return [d for d in dirs if d.is_dir() and any(d.iterdir())]
+
+
+def read_recovered_sources(paths: list[Path], sm_root: Path) -> tuple[str, str, int, int]:
+    """
+    Read source-map-recovered files written during this run.
+    Returns (first_party_text, vendor_text, n_first_party, n_vendor).
+    """
+    app, vendor = [], []
+    for p in paths:
+        if p.suffix.lower() not in SOURCE_EXTENSIONS:
+            continue
         try:
-            b64 = map_ref.split(",", 1)[1]
-            map_json = base64.b64decode(b64).decode("utf-8")
-        except Exception:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        (vendor if is_vendor_path(p, sm_root) else app).append(text)
+    return "\n".join(app), "\n".join(vendor), len(app), len(vendor)
+
+
+def try_recover_sourcemap(js_code: str, js_url: str, session: requests.Session, out_dir: Path,
+                          headers=None, guess: bool = True, written: list = None) -> int:
+    """
+    Recover original (pre-bundle) sources for one script.
+
+    The map is located via the sourceMappingURL comment, the SourceMap /
+    X-SourceMap header, or — if neither exists and guess=True — by trying
+    <script URL>.map (production sites often strip the comment but leave the
+    .map file deployed).
+
+    Output for each script goes to its own folder so same-named sources from
+    different bundles don't overwrite each other:
+      sourcemap_recovered/<bundle>/<original/path/...>
+      sourcemap_recovered/<bundle>/_sources.txt   (every path listed in the
+                                                   map, even without content)
+    Returns the number of source files written.
+    """
+    map_ref = find_sourcemap_ref(js_code, headers)
+    guessed = False
+
+    if map_ref and map_ref.startswith("data:"):
+        map_text = _decode_data_uri(map_ref)
+        map_origin = "inline data: URI"
+        if map_text is None:
+            print(f"    {yellow('[WARN]')} Could not decode inline source map in {js_url}")
             return 0
     else:
-        map_url = resolve(map_ref, js_url)
+        if map_ref:
+            map_url = resolve(map_ref, js_url)
+        elif guess:
+            map_url = js_url.split("#", 1)[0].split("?", 1)[0] + ".map"
+            guessed = True
+        else:
+            return 0
         if not map_url:
             return 0
-        print(f"    {cyan('[SourceMap]')} Fetching: {map_url}")
-        resp = fetch(map_url, session)
+        if not guessed:
+            print(f"    {cyan('[SourceMap]')} Fetching: {map_url}")
+        resp = fetch(map_url, session, quiet=guessed)
         if not resp:
             return 0
-        map_json = resp.text
+        map_text = resp.text
+        map_origin = map_url
 
     try:
-        sm = sourcemap_lib.loads(map_json)
-    except Exception as e:
-        print(f"    {yellow('[WARN]')} Could not parse source map: {e}")
+        entries = parse_sourcemap(map_text)
+    except (ValueError, TypeError, AttributeError) as e:
+        # A guessed URL hitting a soft-404 HTML page is expected — stay quiet
+        if not guessed:
+            print(f"    {yellow('[WARN]')} Could not parse source map {map_origin}: {e}")
         return 0
+    if not entries:
+        return 0
+    if guessed:
+        print(f"    {cyan('[SourceMap]')} Found undeclared map: {map_origin}")
 
-    recovered = 0
-    sm_dir = out_dir / "sourcemap_recovered"
-    sm_dir.mkdir(parents=True, exist_ok=True)
+    bundle_name = safe_filename(js_url, prefix="map")[:-len(".js")]
+    bundle_dir = out_dir / "sourcemap_recovered" / bundle_name
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    bundle_root = bundle_dir.resolve()
 
-    for src_file in (sm.sources or []):
-        try:
-            content = sm.sources_content.get(src_file, "")
-            if not content:
-                continue
-            # Keep relative path structure but make it safe
-            safe_path = re.sub(r"[^\w/.\-]", "_", src_file).lstrip("/")
-            dest = sm_dir / safe_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(
-                f"/* Recovered from source map\n   Original: {src_file}\n   Map URL:  {js_url}\n*/\n\n"
-                + beautify(content),
-                encoding="utf-8",
-            )
-            recovered += 1
-        except Exception:
+    recovered, unsafe = 0, 0
+    index_lines = [f"# script: {js_url}", f"# map:    {map_origin}", ""]
+    for src_file, content in entries:
+        dest = safe_sourcemap_dest(src_file, bundle_root)
+        if dest is None:
+            unsafe += 1
+            index_lines.append(f"[unsafe-skipped] {src_file}")
             continue
+        if content is None:
+            index_lines.append(f"[no-content]     {src_file}")
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Original sources are already readable and may be .ts/.vue/.css,
+            # so they're written as-is rather than run through the JS beautifier.
+            dest.write_text(content, encoding="utf-8")
+        except OSError as e:
+            index_lines.append(f"[write-error]    {src_file}  ({e})")
+            continue
+        recovered += 1
+        if written is not None:
+            written.append(dest)
+        index_lines.append(f"{dest.relative_to(bundle_root)}  <-  {src_file}")
 
-    if recovered:
-        print(f"    {green('[SourceMap]')} Recovered {recovered} original source file(s) → {sm_dir}")
+    (bundle_dir / "_sources.txt").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+
+    no_content = len(entries) - recovered - unsafe
+    msg = f"Recovered {recovered}/{len(entries)} source file(s) → {bundle_dir}"
+    if no_content:
+        msg += f"  ({no_content} listed without content)"
+    print(f"    {green('[SourceMap]')} {msg}")
+    if unsafe:
+        print(f"    {yellow('[WARN]')} Skipped {unsafe} source path(s) that tried to escape the output dir")
     return recovered
 
 
@@ -446,6 +645,12 @@ def run_katana(url: str, depth: int = 2, headers: dict = None, cookies: dict = N
         return []
 
     cmd = ["katana", "-u", url, "-d", str(depth), "-silent", "-jc"]
+
+    # katana sends -H headers to every in-scope host, and its default scope
+    # (rdn) covers all subdomains. When credentials are supplied, restrict
+    # the crawl to the exact target host so they don't leak elsewhere.
+    if headers or cookies:
+        cmd += ["-fs", "fqdn"]
 
     # katana accepts repeated -H "Key: Value" for custom headers (auth, cookie, etc.)
     if headers:
@@ -526,7 +731,23 @@ def run_gau(domain: str, providers: list[str] = None, timeout: int = 180,
 
 
 def run_httpx_probe(urls: list[str], headers: dict = None, cookies: dict = None,
-                     threads: int = 50, timeout: int = 300) -> list[dict]:
+                     threads: int = 50, timeout: int = 300, target_url: str = "") -> list[dict]:
+    """
+    Probe URLs with httpx. Credentials (headers/cookies) are only used for
+    URLs on the exact target host; every other URL (other subdomains from
+    gau --subs, third parties) is probed in a separate run without them.
+    """
+    if not (headers or cookies) or not target_url:
+        return _run_httpx(urls, headers, cookies, threads, timeout)
+    scope = ScopedAuth(target_url, {}, {})
+    in_scope = [u for u in urls if scope.in_scope(u)]
+    out_scope = [u for u in urls if not scope.in_scope(u)]
+    return (_run_httpx(in_scope, headers, cookies, threads, timeout)
+            + _run_httpx(out_scope, None, None, threads, timeout))
+
+
+def _run_httpx(urls: list[str], headers: dict = None, cookies: dict = None,
+               threads: int = 50, timeout: int = 300) -> list[dict]:
     """
     Shell out to httpx (ProjectDiscovery's HTTP toolkit — NOT the Python
     `httpx` library) to probe a list of URLs and report which are alive,
@@ -932,12 +1153,15 @@ def run_wappalyzer(url: str, timeout: int = 60) -> list[dict]:
     return results
 
 
-def run_retire(js_dir: Path, timeout: int = 120) -> list[dict]:
+def run_retire(js_dirs: list[Path], timeout: int = 120) -> list[dict]:
     """
-    Run retire.js (npm install -g retire) against a directory of downloaded
-    JS files. This is a local, signature-based CVE scanner — a useful
-    complement to the live OSV.dev lookup in lookup_cves(), since it also
-    catches hash-fingerprinted minified files that carry no version banner.
+    Run retire.js (npm install -g retire) against every given directory —
+    downloaded bundles, inline blocks AND source-map-recovered sources.
+    Vendor code (node_modules/) is deliberately included here: recovered
+    node_modules/<lib>/ files are exactly what retire.js fingerprints best.
+    This is a local, signature-based CVE scanner — a useful complement to
+    the live OSV.dev lookup in lookup_cves(), since it also catches
+    hash-fingerprinted minified files that carry no version banner.
 
     Returns a list of {"file", "component", "version", "vulnerabilities": [...]}.
     """
@@ -945,10 +1169,21 @@ def run_retire(js_dir: Path, timeout: int = 120) -> list[dict]:
         print(f"  {yellow('[WARN]')} retire.js not found on PATH — skipping local CVE scan.")
         print(f"  {yellow('[WARN]')} Install: npm install -g retire")
         return []
-    if not js_dir.exists() or not any(js_dir.iterdir()):
-        print(f"  {yellow('[WARN]')} No downloaded JS directory to scan with retire.js")
+    if not js_dirs:
+        print(f"  {yellow('[WARN]')} No JS directory to scan with retire.js")
         return []
 
+    results = []
+    for d in js_dirs:
+        results += _run_retire_dir(d, timeout)
+    total_vulns = sum(len(r["vulnerabilities"]) for r in results)
+    print(f"  {green('[retire.js]')} {len(results)} vulnerable component instance(s), "
+          f"{total_vulns} finding(s) total")
+    return results
+
+
+def _run_retire_dir(js_dir: Path, timeout: int = 120) -> list[dict]:
+    """retire.js against a single directory (it only accepts one --path)."""
     print(f"  {cyan('[retire.js]')} Scanning {js_dir} for known-vulnerable components...")
     try:
         proc = subprocess.run(
@@ -992,17 +1227,16 @@ def run_retire(js_dir: Path, timeout: int = 120) -> list[dict]:
                     ],
                 })
 
-    total_vulns = sum(len(r["vulnerabilities"]) for r in results)
-    print(f"  {green('[retire.js]')} {len(results)} vulnerable component instance(s), "
-          f"{total_vulns} finding(s) total")
     return results
 
 
-def run_semgrep(target_dir: Path, configs: list[str] = None, timeout: int = 300) -> list[dict]:
+def run_semgrep(target_dirs: list[Path], configs: list[str] = None, timeout: int = 300) -> list[dict]:
     """
-    Run semgrep static analysis against downloaded/extracted JS for
-    dangerous client-side patterns (matches the manual step:
-    `semgrep --config "p/xss" ./`).
+    Run semgrep static analysis against downloaded bundles, inline blocks and
+    source-map-recovered sources for dangerous client-side patterns (matches
+    the manual step: `semgrep --config "p/xss" ./`). Recovered first-party
+    sources are the most valuable target: readable, unminified code where
+    source→sink flows are actually visible. Vendor code is excluded.
 
     Returns a list of {"rule_id", "file", "line", "message", "severity"}.
     """
@@ -1010,7 +1244,7 @@ def run_semgrep(target_dir: Path, configs: list[str] = None, timeout: int = 300)
         print(f"  {yellow('[WARN]')} semgrep not found on PATH — skipping static analysis.")
         print(f"  {yellow('[WARN]')} Install: pip install semgrep  (or: pip install --break-system-packages semgrep)")
         return []
-    if not target_dir.exists() or not any(target_dir.iterdir()):
+    if not target_dirs:
         print(f"  {yellow('[WARN]')} No JS directory to scan with semgrep")
         return []
 
@@ -1018,9 +1252,12 @@ def run_semgrep(target_dir: Path, configs: list[str] = None, timeout: int = 300)
     cmd = ["semgrep", "--json", "--quiet"]
     for c in configs:
         cmd += ["--config", c]
-    cmd.append(str(target_dir))
+    for d in VENDOR_DIR_NAMES:
+        cmd += ["--exclude", d]
+    cmd += [str(d) for d in target_dirs]
 
-    print(f"  {cyan('[semgrep]')} Running static analysis ({', '.join(configs)}) on {target_dir}...")
+    where = ", ".join(str(d) for d in target_dirs)
+    print(f"  {cyan('[semgrep]')} Running static analysis ({', '.join(configs)}) on {where}...")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1050,11 +1287,13 @@ def run_semgrep(target_dir: Path, configs: list[str] = None, timeout: int = 300)
     return results
 
 
-def run_linkfinder(target_dir: Path, linkfinder_path: str = "", timeout: int = 120) -> list[str]:
+def run_linkfinder(target_dirs: list[Path], linkfinder_path: str = "", timeout: int = 120) -> list[str]:
     """
     Run LinkFinder (https://github.com/GerbenJavado/LinkFinder) against every
-    .js file in target_dir to extract endpoint-like strings — a complement to
-    our own extract_endpoints() regex pass, using LinkFinder's own patterns.
+    script/source file in target_dirs (bundles, inline blocks, recovered
+    .js/.ts/.vue/... sources; vendor code skipped) to extract endpoint-like
+    strings — a complement to our own extract_endpoints() regex pass, using
+    LinkFinder's own patterns.
 
     LinkFinder isn't a pip package with a stable console-script name, so this
     looks for (in order): an explicit --linkfinder-path, a `linkfinder`
@@ -1075,12 +1314,12 @@ def run_linkfinder(target_dir: Path, linkfinder_path: str = "", timeout: int = 1
         print(f"  {yellow('[WARN]')} Install: git clone https://github.com/GerbenJavado/LinkFinder && "
               f"pip install -r LinkFinder/requirements.txt, then pass --linkfinder-path /path/to/linkfinder.py")
         return []
-    if not target_dir.exists():
-        return []
-
-    js_files = list(target_dir.rglob("*.js"))
+    js_files = [
+        f for d in target_dirs for f in sorted(d.rglob("*"))
+        if f.is_file() and f.suffix.lower() in SOURCE_EXTENSIONS and not is_vendor_path(f, d)
+    ]
     if not js_files:
-        print(f"  {yellow('[WARN]')} No .js files under {target_dir} for LinkFinder to scan")
+        print(f"  {yellow('[WARN]')} No script files under {', '.join(map(str, target_dirs))} for LinkFinder to scan")
         return []
 
     print(f"  {cyan('[LinkFinder]')} Scanning {len(js_files)} file(s)...")
@@ -1125,10 +1364,20 @@ def save_js(content: str, path: Path, url: str = "") -> None:
 
 def generate_report(data: dict, out_dir: Path) -> Path:
     """Build a self-contained HTML analysis report."""
+    # Everything in `data` comes from the target (JS contents, URLs, tool
+    # output) and must be treated as hostile: escape every interpolated value
+    # and only allow http(s) links. The CSP below is defence in depth.
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def e(value) -> str:
+        return html_escape(str(value), quote=True)
+
+    def safe_href(url) -> str:
+        url = str(url).strip()
+        return e(url) if urlparse(url).scheme.lower() in ("http", "https") else "#"
+
     def badge(text, color):
-        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold">{text}</span>'
+        return f'<span style="background:{color};color:#fff;padding:2px 8px;border-radius:4px;font-size:12px;font-weight:bold">{e(text)}</span>'
 
     def section(title, content_html, color="#2563eb"):
         return f"""
@@ -1144,8 +1393,8 @@ def generate_report(data: dict, out_dir: Path) -> Path:
         kind_badge = badge(f["kind"], "#6366f1" if f["kind"] == "external" else "#0891b2")
         file_rows += f"""<tr>
           <td>{kind_badge}</td>
-          <td style="word-break:break-all"><a href="{f['saved_path']}" target="_blank">{f['filename']}</a></td>
-          <td><a href="{f['url']}" target="_blank" style="font-size:11px">{f['url'][:80]}{'...' if len(f['url'])>80 else ''}</a></td>
+          <td style="word-break:break-all"><a href="{e(f['saved_path'])}" target="_blank" rel="noopener noreferrer">{e(f['filename'])}</a></td>
+          <td><a href="{safe_href(f['url'])}" target="_blank" rel="noopener noreferrer" style="font-size:11px">{e(f['url'][:80])}{'...' if len(f['url'])>80 else ''}</a></td>
           <td>{f['size_kb']:.1f} KB</td>
         </tr>"""
     files_html = f"""
@@ -1167,19 +1416,19 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     for ep in data.get("endpoints", []):
         is_hidden = ep in data.get("hidden_endpoints", [])
         flag = f' {badge("HIDDEN", "#dc2626")}' if is_hidden else ""
-        ep_rows += f"<tr><td style='padding:5px;font-family:monospace;word-break:break-all'>{ep}{flag}</td></tr>\n"
+        ep_rows += f"<tr><td style='padding:5px;font-family:monospace;word-break:break-all'>{e(ep)}{flag}</td></tr>\n"
     ep_html = f"<table style='width:100%;border-collapse:collapse'>{ep_rows}</table>" if ep_rows else "<i>No endpoints extracted (use --endpoints)</i>"
 
     # ── Params ───────────────────────────────────────────────────────────────
     param_chips = "".join(
-        f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;display:inline-block">{p}</code>'
+        f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;display:inline-block">{e(p)}</code>'
         for p in data.get("params", [])
     ) or "<i>No params extracted (use --params)</i>"
 
     # Wordlist file path
     wordlist_note = ""
     if data.get("params"):
-        wordlist_note = f'<p style="margin-top:8px">📄 Wordlist saved to: <code>{data.get("wordlist_path","")}</code></p>'
+        wordlist_note = f'<p style="margin-top:8px">📄 Wordlist saved to: <code>{e(data.get("wordlist_path",""))}</code></p>'
 
     # ── Secrets ──────────────────────────────────────────────────────────────
     sec_rows = ""
@@ -1190,8 +1439,8 @@ def generate_report(data: dict, out_dir: Path) -> Path:
         sec_rows += (
             f"<tr>"
             f"<td style='padding:5px'>{badge(s['type'], '#dc2626')}</td>"
-            f"<td style='padding:5px;font-family:monospace'>{masked}</td>"
-            f"<td style='padding:5px'>Line {s['line']}</td>"
+            f"<td style='padding:5px;font-family:monospace'>{e(masked)}</td>"
+            f"<td style='padding:5px'>Line {e(s['line'])}</td>"
             f"</tr>\n"
         )
     sec_html = (
@@ -1210,15 +1459,15 @@ def generate_report(data: dict, out_dir: Path) -> Path:
         hits = cves_by_lib.get(key, [])
         if hits:
             cve_badges = " ".join(
-                f'<a href="{c["url"]}" target="_blank">{badge(c["cve"] or c["id"], "#dc2626")}</a>'
+                f'<a href="{safe_href(c["url"])}" target="_blank" rel="noopener noreferrer">{badge(c["cve"] or c["id"], "#dc2626")}</a>'
                 for c in hits
             )
             status = cve_badges
         else:
             status = badge("no known CVEs", "#16a34a")
         lib_rows += f"""<tr>
-          <td style="padding:5px;font-family:monospace">{l['name']}</td>
-          <td style="padding:5px;font-family:monospace">{l['version']}</td>
+          <td style="padding:5px;font-family:monospace">{e(l['name'])}</td>
+          <td style="padding:5px;font-family:monospace">{e(l['version'])}</td>
           <td style="padding:5px">{status}</td>
         </tr>"""
     lib_html = (
@@ -1236,10 +1485,10 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     for c in data.get("cves", []):
         cve_detail_rows += f"""<tr>
           <td style="padding:5px">{badge(c['cve'] or c['id'], '#dc2626')}</td>
-          <td style="padding:5px;font-family:monospace">{c['library']}@{c['version']}</td>
-          <td style="padding:5px">{c['severity'] or '<i>n/a</i>'}</td>
-          <td style="padding:5px;font-size:12px">{c['summary']}</td>
-          <td style="padding:5px"><a href="{c['url']}" target="_blank">osv.dev</a></td>
+          <td style="padding:5px;font-family:monospace">{e(c['library'])}@{e(c['version'])}</td>
+          <td style="padding:5px">{e(c['severity']) if c['severity'] else '<i>n/a</i>'}</td>
+          <td style="padding:5px;font-size:12px">{e(c['summary'])}</td>
+          <td style="padding:5px"><a href="{safe_href(c['url'])}" target="_blank" rel="noopener noreferrer">osv.dev</a></td>
         </tr>"""
     cve_html = (
         f"""<table style='width:100%;border-collapse:collapse'>
@@ -1257,7 +1506,7 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     # ── Technologies (wappalyzer) ────────────────────────────────────────────
     tech_chips = "".join(
         f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;display:inline-block">'
-        f'{t["name"]}{" v" + t["version"] if t["version"] else ""}</code>'
+        f'{e(t["name"])}{" v" + e(t["version"]) if t["version"] else ""}</code>'
         for t in data.get("technologies", [])
     ) or "<i>No tech-stack data (use --wappalyzer)</i>"
 
@@ -1270,9 +1519,9 @@ def generate_report(data: dict, out_dir: Path) -> Path:
             label = ", ".join(cve_list) if cve_list else (ids.get("summary", "") or "unlabeled")
             retire_rows += f"""<tr>
               <td style="padding:5px">{badge(label, '#dc2626')}</td>
-              <td style="padding:5px;font-family:monospace">{r['component']}@{r['version']}</td>
-              <td style="padding:5px">{v.get('severity', '') or '<i>n/a</i>'}</td>
-              <td style="padding:5px;font-size:12px;word-break:break-all">{r['file']}</td>
+              <td style="padding:5px;font-family:monospace">{e(r['component'])}@{e(r['version'])}</td>
+              <td style="padding:5px">{e(v.get('severity', '')) if v.get('severity') else '<i>n/a</i>'}</td>
+              <td style="padding:5px;font-size:12px;word-break:break-all">{e(r['file'])}</td>
             </tr>"""
     retire_html = (
         f"""<table style='width:100%;border-collapse:collapse'>
@@ -1291,9 +1540,9 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     for s in data.get("semgrep_findings", []):
         semgrep_rows += f"""<tr>
           <td style="padding:5px">{badge(s['severity'] or 'INFO', '#b45309')}</td>
-          <td style="padding:5px;font-family:monospace;font-size:12px">{s['rule_id']}</td>
-          <td style="padding:5px;font-size:12px">{s['file']}:{s['line']}</td>
-          <td style="padding:5px;font-size:12px">{s['message']}</td>
+          <td style="padding:5px;font-family:monospace;font-size:12px">{e(s['rule_id'])}</td>
+          <td style="padding:5px;font-size:12px">{e(s['file'])}:{e(s['line'])}</td>
+          <td style="padding:5px;font-size:12px">{e(s['message'])}</td>
         </tr>"""
     semgrep_html = (
         f"""<table style='width:100%;border-collapse:collapse'>
@@ -1310,15 +1559,17 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     # ── LinkFinder endpoints ──────────────────────────────────────────────────
     lf_chips = "".join(
         f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;'
-        f'display:inline-block;word-break:break-all">{e}</code>'
-        for e in data.get("linkfinder_endpoints", [])
+        f'display:inline-block;word-break:break-all">{e(lf)}</code>'
+        for lf in data.get("linkfinder_endpoints", [])
     ) or "<i>No LinkFinder results (or --linkfinder was not used)</i>"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>JS Extractor Report — {data['target_url']}</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<title>JS Extractor Report — {e(data['target_url'])}</title>
 <style>
   body {{ font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #f8fafc; color: #1e293b; }}
   .wrap {{ max-width: 1100px; margin: auto; padding: 24px; }}
@@ -1338,7 +1589,7 @@ def generate_report(data: dict, out_dir: Path) -> Path:
 <div class="wrap">
   <h1>🔍 JS Extractor Report</h1>
   <div class="meta">
-    Target: <a href="{data['target_url']}" target="_blank">{data['target_url']}</a>
+    Target: <a href="{safe_href(data['target_url'])}" target="_blank" rel="noopener noreferrer">{e(data['target_url'])}</a>
     &nbsp;|&nbsp; Generated: {ts}
   </div>
 
@@ -1470,7 +1721,8 @@ def main():
 
     session = requests.Session()
     session.headers.update(build_headers(args))
-    session.cookies.update(build_cookies(args))
+    # Credentials go only to the target host (see ScopedAuth)
+    session.auth = ScopedAuth(args.url, build_auth_headers(args), build_cookies(args))
 
     # ── Step 1: Fetch the page ────────────────────────────────────────────────
     print(f"\n{bold('[*]')} Target: {cyan(args.url)}\n")
@@ -1507,7 +1759,7 @@ def main():
         katana_js = run_katana(
             args.url,
             depth=args.katana_depth,
-            headers=build_headers(args),
+            headers=build_auth_headers(args),
             cookies=build_cookies(args),
         )
         all_ext_urls = list(dict.fromkeys(all_ext_urls + katana_js))
@@ -1522,8 +1774,9 @@ def main():
             if args.httpx_probe:
                 alive = run_httpx_probe(
                     gau_urls,
-                    headers=build_headers(args),
+                    headers=build_auth_headers(args),
                     cookies=build_cookies(args),
+                    target_url=args.url,
                 )
                 alive_path = output_dir / "gau_alive.txt"
                 with alive_path.open("w", encoding="utf-8") as f:
@@ -1549,6 +1802,7 @@ def main():
     file_records = []         # for report
     workers_to_fetch = set()
     imports_to_fetch = set()
+    recovered_paths = []      # source-map-recovered files written this run
 
     # ── Step 3: Download & beautify external scripts ──────────────────────────
     if not args.no_external:
@@ -1583,7 +1837,8 @@ def main():
 
             # Source map recovery
             if not args.no_sourcemaps:
-                try_recover_sourcemap(raw, src_url, session, output_dir)
+                try_recover_sourcemap(raw, src_url, session, output_dir,
+                                      headers=js_resp.headers, written=recovered_paths)
 
             # Follow imports
             if not args.no_imports:
@@ -1650,8 +1905,21 @@ def main():
         "technologies": wappalyzer_techs,
     }
 
+    # Fold source-map-recovered originals into the analysis. First-party code
+    # feeds every regex pass; vendor (node_modules) code only feeds framework
+    # and library-version detection, where it helps instead of adding noise.
+    sm_root = (output_dir / "sourcemap_recovered").resolve()
+    sm_app_text, sm_vendor_text, n_sm_app, n_sm_vendor = read_recovered_sources(recovered_paths, sm_root)
+    if n_sm_app or n_sm_vendor:
+        print(f"\n{bold('[SourceMap]')} Including {n_sm_app} first-party + {n_sm_vendor} vendor "
+              f"recovered source file(s) in analysis")
+    if sm_app_text:
+        all_js_text += sm_app_text + "\n"
+    fingerprint_text = all_js_text + sm_vendor_text
+    report_data["sourcemap_files"] = {"first_party": n_sm_app, "vendor": n_sm_vendor}
+
     # Framework detection (always runs if we have JS)
-    frameworks = detect_frameworks(all_js_text) if all_js_text else []
+    frameworks = detect_frameworks(fingerprint_text) if fingerprint_text else []
     report_data["frameworks"] = frameworks
     if frameworks:
         print(f"\n{bold('[Framework]')} Detected: {', '.join(yellow(f) for f in frameworks)}")
@@ -1710,9 +1978,9 @@ def main():
     # Library versions + CVE matching
     report_data["libraries"] = []
     report_data["cves"] = []
-    if args.cve and all_js_text:
+    if args.cve and fingerprint_text:
         print(f"\n{bold('[CVE]')} Fingerprinting library versions...")
-        libs = detect_library_versions(all_js_text)
+        libs = detect_library_versions(fingerprint_text)
         report_data["libraries"] = libs
 
         if not libs:
@@ -1749,7 +2017,7 @@ def main():
     report_data["retire_findings"] = []
     if args.retire:
         print(f"\n{bold('[retire.js]')} Scanning downloaded JS for known-vulnerable components...")
-        retire_findings = run_retire(output_dir / "external")
+        retire_findings = run_retire(analysis_dirs(output_dir))
         report_data["retire_findings"] = retire_findings
         if retire_findings:
             retire_path = output_dir / "retire_report.txt"
@@ -1767,7 +2035,7 @@ def main():
     report_data["semgrep_findings"] = []
     if args.semgrep:
         print(f"\n{bold('[semgrep]')} Running static analysis...")
-        semgrep_findings = run_semgrep(output_dir / "external", configs=args.semgrep_config)
+        semgrep_findings = run_semgrep(analysis_dirs(output_dir), configs=args.semgrep_config)
         report_data["semgrep_findings"] = semgrep_findings
         if semgrep_findings:
             semgrep_path = output_dir / "semgrep_report.txt"
@@ -1782,7 +2050,7 @@ def main():
     report_data["linkfinder_endpoints"] = []
     if args.linkfinder:
         print(f"\n{bold('[LinkFinder]')} Extracting endpoints from downloaded JS...")
-        lf_endpoints = run_linkfinder(output_dir / "external", linkfinder_path=args.linkfinder_path)
+        lf_endpoints = run_linkfinder(analysis_dirs(output_dir), linkfinder_path=args.linkfinder_path)
         report_data["linkfinder_endpoints"] = lf_endpoints
         if lf_endpoints:
             lf_path = output_dir / "linkfinder_endpoints.txt"

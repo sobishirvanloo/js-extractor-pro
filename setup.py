@@ -22,11 +22,7 @@ setup(
     ],
     extras_require={
         "dynamic": ["playwright>=1.40.0"],
-        "sourcemaps": ["python-sourcemap>=0.5"],
-        "full": [
-            "playwright>=1.40.0",
-            "python-sourcemap>=0.5",
-        ],
+        "full": ["playwright>=1.40.0"],
     },
     entry_points={
         "console_scripts": [

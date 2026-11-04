@@ -20,7 +20,9 @@ scanning, framework fingerprinting, and known-CVE lookups.
 - Static extraction (`requests` + BeautifulSoup)
 - Dynamic extraction via headless Chromium (Playwright) — `--dynamic`
 - Follows JS imports/chunks referenced inside script files
-- Parses source maps (`.js.map`) to recover original pre-bundle code
+- Parses source maps (`.js.map`) to recover original pre-bundle code — found via the
+  `sourceMappingURL` comment, the `SourceMap`/`X-SourceMap` header, or by probing `<script>.map`
+  (no extra dependency; uses the stdlib `json` parser)
 - Extracts JS from Web Workers and Service Workers
 - Framework detection (React, Vue, Angular, Next.js, Nuxt, Svelte, ...)
 - Deep crawl via [katana](https://github.com/projectdiscovery/katana) to discover more JS across the site — `--katana`
@@ -45,7 +47,6 @@ scanning, framework fingerprinting, and known-CVE lookups.
 | Flag                | Requires                                                                 |
 |----------------------|---------------------------------------------------------------------------|
 | `--dynamic`          | `playwright` (Python package) + Chromium browser binary                  |
-| source map recovery  | `python-sourcemap`                                                       |
 | `--katana`           | [katana](https://github.com/projectdiscovery/katana) binary on `PATH`    |
 | `--gau`              | [gau](https://github.com/lc/gau) binary on `PATH`                        |
 | `--httpx-probe`      | [httpx](https://github.com/projectdiscovery/httpx) binary on `PATH` (ProjectDiscovery's HTTP toolkit — not the Python `httpx` library) |
@@ -150,7 +151,7 @@ python3 js_extractor/cli.py <url> [options]
 --no-inline                  # Skip inline <script> blocks
 --no-external                # Skip external .js files
 --no-workers                 # Skip Web Workers / Service Workers
---no-sourcemaps              # Skip source map recovery
+--no-sourcemaps              # Skip source map recovery (incl. probing <script>.map)
 --no-imports                 # Skip following import/require chains
 ```
 
@@ -217,6 +218,7 @@ js-extractor https://target.com/dashboard \
 js_output/
 ├── external/                # Downloaded + beautified external .js files
 ├── inline/                  # Beautified inline <script> blocks
+├── sourcemap_recovered/     # Original sources, one folder per bundle (+ _sources.txt index)
 ├── ALL_SCRIPTS_MERGED.js    # (with --merge)
 ├── endpoints.txt            # (with --endpoints)
 ├── endpoints_hidden.txt     # (with --endpoints)

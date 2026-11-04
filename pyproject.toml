@@ -17,8 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dynamic = ["playwright>=1.40.0"]
-sourcemaps = ["python-sourcemap>=0.5"]
-full = ["playwright>=1.40.0", "python-sourcemap>=0.5"]
+full = ["playwright>=1.40.0"]
 
 [project.scripts]
 js-extractor = "js_extractor.cli:main"

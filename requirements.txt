@@ -4,6 +4,3 @@ jsbeautifier>=1.15.0
 
 # Optional (needed only for --dynamic)
 # playwright>=1.40.0
-
-# Optional (needed only for source map recovery)
-# python-sourcemap>=0.5
