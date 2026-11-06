@@ -276,6 +276,88 @@ def generate_report(data: dict, out_dir: Path) -> Path:
                        f"candidate URLs ({e(ch.get('webpack_runtimes', 0))} webpack runtime(s))</p>"
                        + route_chips)
 
+    # ── GraphQL ───────────────────────────────────────────────────────────────
+    gql = data.get("graphql") or {}
+    gql_rows = ""
+    for o in gql.get("operations", []):
+        gql_rows += (f"<tr><td style='padding:5px'>{badge(o['type'], {'query':'#0891b2','mutation':'#dc2626','subscription':'#7c3aed'}.get(o['type'],'#475569'))}</td>"
+                     f"<td style='padding:5px;font-family:monospace'>{e(o['name'])}</td>"
+                     f"<td style='padding:5px;font-size:12px'>{e(', '.join(o.get('fields', [])[:12]))}</td>"
+                     f"<td style='padding:5px;font-size:11px;color:#64748b'>{e(o.get('file',''))}:{e(o.get('line',''))}</td></tr>")
+    gql_ep_chips = "".join(
+        f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;display:inline-block;word-break:break-all">{e(ep["url"])}</code>'
+        for ep in gql.get("endpoints", []))
+    schema_note = ""
+    for s in data.get("graphql_schemas", []):
+        schema_note += (f"<p style='color:#b91c1c'><b>Introspection OPEN</b> at {e(s.get('endpoint',''))}: "
+                        f"{e(s.get('type_count',0))} types (query={e(s.get('query_type'))}, "
+                        f"mutation={e(s.get('mutation_type'))})</p>")
+    graphql_html = (
+        (f"<table style='width:100%;border-collapse:collapse'><tr style='background:#f1f5f9;font-weight:bold'>"
+         f"<th style='padding:8px;text-align:left'>Type</th><th style='padding:8px;text-align:left'>Operation</th>"
+         f"<th style='padding:8px;text-align:left'>Root fields</th><th style='padding:8px;text-align:left'>Source</th></tr>"
+         f"{gql_rows}</table>"
+         + (f"<p style='margin-top:8px'><b>Endpoints:</b> {gql_ep_chips}</p>" if gql_ep_chips else "")
+         + schema_note)
+        if gql_rows or gql_ep_chips else "<i>No GraphQL found (or --graphql was not used)</i>"
+    )
+
+    # ── Embedded config ───────────────────────────────────────────────────────
+    cfg_colour = {"config-object": "#2563eb", "feature-flag": "#059669",
+                  "internal-host": "#d97706", "cloud-resource": "#b45309", "env-var": "#64748b"}
+    cfg_rows = ""
+    for c in data.get("config", []):
+        label = e(c["name"]) if c["name"] else "<i>—</i>"
+        cfg_rows += (f"<tr><td style='padding:5px'>{badge(c['kind'], cfg_colour.get(c['kind'], '#475569'))}</td>"
+                     f"<td style='padding:5px;font-family:monospace'>{label}</td>"
+                     f"<td style='padding:5px;font-family:monospace;font-size:12px;word-break:break-all'>{e(c['value'])}</td>"
+                     f"<td style='padding:5px;font-size:11px;color:#64748b'>{e(c['file'])}:{e(c['line'])}</td></tr>")
+    config_html = (
+        f"<table style='width:100%;border-collapse:collapse'><tr style='background:#f1f5f9;font-weight:bold'>"
+        f"<th style='padding:8px;text-align:left'>Kind</th><th style='padding:8px;text-align:left'>Name</th>"
+        f"<th style='padding:8px;text-align:left'>Value</th><th style='padding:8px;text-align:left'>Source</th></tr>"
+        f"{cfg_rows}</table>" if cfg_rows else "<i>No embedded config found (or --config was not used)</i>"
+    )
+
+    # ── Source intelligence + dependency confusion ────────────────────────────
+    si = data.get("source_intel") or {}
+    dep = data.get("dep_confusion") or []
+    claimable = [d for d in dep if d.get("status") == "claimable"]
+    dep_html = "".join(
+        f'<li style="color:#b91c1c"><b>{e(d["name"])}</b> — claimable (risk {e(d["risk"])}{" · scoped" if d.get("scoped") else ""})</li>'
+        for d in claimable)
+    pkg_chips = "".join(
+        f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;display:inline-block">{e(p)}</code>'
+        for p in si.get("packages", [])[:200])
+    todo_rows = "".join(
+        f"<tr><td style='padding:4px'>{badge(e(t['tag']), '#d97706')}</td>"
+        f"<td style='padding:4px;font-size:12px'>{e(t['text'])}</td>"
+        f"<td style='padding:4px;font-size:11px;color:#64748b'>{e(t['file'])}:{e(t['line'])}</td></tr>"
+        for t in si.get("todos", [])[:50])
+    email_chips = "".join(
+        f'<code style="margin:2px;padding:3px 7px;background:#f1f5f9;border-radius:4px;display:inline-block">{e(a)}</code>'
+        for a in si.get("emails", []))
+    source_intel_html = (
+        ((f"<p style='color:#b91c1c'><b>⚠️ Dependency-confusion candidates ({len(claimable)}):</b></p><ul>{dep_html}</ul>" if claimable else "")
+         + f"<p><b>Packages ({len(si.get('packages', []))}):</b> {pkg_chips or '<i>none</i>'}</p>"
+         + f"<p><b>First-party source paths:</b> {e(si.get('tree_count', 0))}</p>"
+         + (f"<p><b>Emails:</b> {email_chips}</p>" if email_chips else "")
+         + (f"<p><b>TODO / FIXME:</b></p><table style='width:100%;border-collapse:collapse'>{todo_rows}</table>" if todo_rows else ""))
+        if si.get("packages") or si.get("todos") or si.get("emails") or claimable
+        else "<i>No source intel (or --source-intel was not used)</i>"
+    )
+
+    # ── Replay-ready artefacts ────────────────────────────────────────────────
+    rp = data.get("replay") or {}
+    replay_html = (
+        (f"<p>Generated from the discovered endpoints — import or run these:</p><ul>"
+         f"<li><code>openapi.json</code> — {e(rp.get('openapi_paths', 0))} path(s), "
+         f"servers: {e(', '.join(rp.get('servers', [])))}</li>"
+         f"<li><code>curl_commands.sh</code> — {e(rp.get('curl_commands', 0))} ready-to-run request(s) (carry your auth)</li>"
+         f"<li><code>ffuf_commands.sh</code> — {e(rp.get('ffuf_commands', 0))} parameter-fuzzing line(s)</li></ul>")
+        if rp else "<i>No replay artefacts (use --replay with --endpoints)</i>"
+    )
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -318,6 +400,9 @@ def generate_report(data: dict, out_dir: Path) -> Path:
     <div class="stat"><div class="stat-num">{len(data.get('technologies', []))}</div><div class="stat-lbl">Technologies</div></div>
     <div class="stat"><div class="stat-num">{sum(len(r['vulnerabilities']) for r in data.get('retire_findings', []))}</div><div class="stat-lbl">retire.js Findings</div></div>
     <div class="stat"><div class="stat-num">{len(data.get('semgrep_findings', []))}</div><div class="stat-lbl">semgrep Findings</div></div>
+    <div class="stat"><div class="stat-num">{len((data.get('graphql') or {}).get('operations', []))}</div><div class="stat-lbl">GraphQL Ops</div></div>
+    <div class="stat"><div class="stat-num">{len(data.get('config', []))}</div><div class="stat-lbl">Config Items</div></div>
+    <div class="stat"><div class="stat-num">{sum(1 for d in data.get('dep_confusion', []) if d.get('status') == 'claimable')}</div><div class="stat-lbl">Claimable Pkgs</div></div>
   </div>
 
   {section("🔧 Detected Frameworks", fw_html, "#7c3aed")}
@@ -325,12 +410,16 @@ def generate_report(data: dict, out_dir: Path) -> Path:
   {section("📁 Extracted Files", files_html, "#2563eb")}
   {section("🔗 API Endpoints", ep_html, "#0891b2")}
   {section("🔗 LinkFinder Endpoints", lf_chips, "#0891b2")}
+  {section("◈ GraphQL Operations & Endpoints", graphql_html, "#0891b2")}
   {section("🧭 Routes & Lazy Chunks", route_chips, "#0891b2")}
   {section("🔑 Parameters (Fuzzing Wordlist)", param_chips + wordlist_note, "#059669")}
+  {section("⚙️ Embedded Config, Flags & Internal Hosts", config_html, "#d97706")}
+  {section("▶️ Replay-ready Artefacts (OpenAPI / curl / ffuf)", replay_html, "#059669")}
   {section("⚠️ Potential Secrets / Credentials", sec_html, "#dc2626")}
   {section("🎯 DOM XSS Sinks & postMessage", dom_html, "#dc2626")}
   {section("📦 Library Versions", lib_html, "#0f766e")}
   {section("🛡️ Known CVEs (OSV.dev)", cve_html, "#b91c1c")}
+  {section("🧬 Source Intel & Dependency Confusion", source_intel_html, "#b91c1c")}
   {section("🛡️ retire.js Findings (local signature scan)", retire_html, "#b91c1c")}
   {section("🧪 semgrep Static Analysis", semgrep_html, "#b45309")}
 </div>

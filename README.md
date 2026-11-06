@@ -77,6 +77,19 @@ scanning, framework fingerprinting, and known-CVE lookups.
   come from both banner comments and versioned filenames (`jquery-3.5.1.min.js`); all libraries are
   resolved in a single batched OSV query, and each CVE is given a numeric CVSS base score and a
   NONE/LOW/MEDIUM/HIGH/CRITICAL band so findings sort and feed `--fail-on cves`
+- **GraphQL recon** — `--graphql`: operations (query/mutation/subscription) with their root fields,
+  fragments, and client transport endpoints (Apollo/urql `uri:`, `/graphql` paths), pulled from
+  bundles and `gql` template literals. `--graphql-introspect` additionally sends an introspection
+  query to each in-scope endpoint and records any schema that answers (active; live targets only)
+- **Embedded config** — `--config`: config objects (`__CONFIG__`, `__NEXT_DATA__`, Firebase, …),
+  boolean feature flags, internal/non-routable hosts and cloud-metadata IPs, cloud storage/service
+  references (S3/GCS/Azure/Firebase/API Gateway) and `process.env` variable names
+- **Replay-ready output** — `--replay`: turns the endpoint list into an OpenAPI 3.0 spec
+  (`openapi.json`), ready-to-run `curl` commands carrying your auth, and `ffuf` parameter-fuzzing lines
+- **Source intelligence** — `--source-intel`: from recovered first-party code, the import/package
+  list, the original project tree, developer emails and TODO/FIXME notes. `--dep-confusion` then
+  checks each package against the public npm registry and flags unpublished (claimable) names —
+  especially scoped `@org/*` — as dependency-confusion candidates
 - Optional integrations: `wappalyzer`, `retire.js`, `semgrep`, `LinkFinder`
 - HTML analysis report generation — `--report`
 
@@ -278,6 +291,12 @@ order). Scripts that turn out to be HTML pages (soft 404s, login redirects, WAF 
 --secrets                    # Scan for leaked keys/tokens/passwords
 --dom                        # Map DOM XSS sinks/sources and postMessage issues
 --cve                        # Fingerprint library versions & check OSV.dev for known CVEs
+--graphql                    # Extract GraphQL operations, fragments & client endpoints
+--graphql-introspect         # Also send an introspection query to each endpoint found (active; live only)
+--config                     # Extract config objects, feature flags, internal hosts, cloud resources, env-vars
+--replay                     # Emit openapi.json + curl_commands.sh + ffuf_commands.sh from the endpoints
+--source-intel               # Packages, project tree, dev emails & TODO/FIXME from recovered first-party code
+--dep-confusion              # Flag imported packages unpublished on npm (claimable) — implies --source-intel (active)
 --wappalyzer                 # Run wappalyzer CLI for tech-stack fingerprinting
 --retire                     # Run retire.js against downloaded JS (local CVE signatures)
 --semgrep                    # Run semgrep static analysis (default: p/xss, p/javascript)
@@ -295,7 +314,7 @@ order). Scripts that turn out to be HTML pages (soft 404s, login redirects, WAF 
 --merge                      # Combine all scripts into one file
 --report                     # Generate HTML analysis report
 --json                       # Print results.json to stdout (progress goes to stderr)
---fail-on LIST               # Exit 3 if found: secrets,cves,hidden-endpoints,retire,semgrep,dom (high)
+--fail-on LIST               # Exit 3 if found: secrets,cves,hidden-endpoints,retire,semgrep,dom,dep-confusion
 ```
 
 `results.json` is always written. It holds every finding (secrets unmasked), the file list, the
@@ -369,6 +388,14 @@ js_output/
 ├── gau_all.txt              # (with --gau, no probe)
 ├── gau_alive.txt            # (with --gau --httpx-probe) — "status_code  url" per line
 ├── params_wordlist.txt      # (with --params)
+├── graphql.json             # (with --graphql) operations, fragments, client endpoints
+├── graphql_schema.json      # (with --graphql-introspect) introspected schemas, if any were open
+├── config.json              # (with --config) config objects, flags, internal hosts, cloud, env-vars
+├── source_intel.json        # (with --source-intel) packages, tree, emails, TODO/FIXME
+├── dep_confusion.json       # (with --dep-confusion) npm status per package (claimable = candidate)
+├── openapi.json             # (with --replay) reconstructed OpenAPI 3.0 spec
+├── curl_commands.sh         # (with --replay) one ready-to-run curl per endpoint (carries your auth)
+├── ffuf_commands.sh         # (with --replay) parameter-fuzzing lines for ffuf
 ├── results.json             # always: all findings + stats, machine-readable
 ├── routes.txt               # (Next.js) client-side routes from _buildManifest.js
 ├── out_of_scope.txt         # (with --scope/--exclude-host) script URLs skipped as out of scope

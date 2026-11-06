@@ -17,6 +17,10 @@ Features:
   - Parameter extraction for fuzzing                       [--params]
   - Secret/token/key pattern detection
   - Library version fingerprinting + CVE lookup (OSV.dev)  [--cve]
+  - GraphQL operations / endpoints (+ introspection)       [--graphql]
+  - Embedded config, feature flags, internal hosts         [--config]
+  - Replay-ready OpenAPI / curl / ffuf from endpoints       [--replay]
+  - Source intel + npm dependency-confusion check          [--source-intel / --dep-confusion]
   - HTML report generation
 
 Usage:
@@ -98,6 +102,10 @@ from js_extractor.analyzers.frameworks import detect_frameworks
 from js_extractor.analyzers.params import extract_params
 from js_extractor.analyzers.secrets import find_secrets, find_secrets_in_files, mask_secret
 from js_extractor.analyzers.versions import detect_library_versions, lookup_cves
+from js_extractor.analyzers.graphql import find_graphql_in_files, INTROSPECTION_QUERY, parse_introspection
+from js_extractor.analyzers.config import find_config_in_files
+from js_extractor.analyzers.replay import build_openapi, build_curl_commands, build_ffuf_commands
+from js_extractor.analyzers.sourceintel import find_source_intel, check_npm_packages
 from js_extractor.discovery.chunks import (
     find_asset_paths,
     find_chunk_ids,
@@ -157,7 +165,7 @@ except ImportError:                       # run directly as a script
     __version__ = "unknown"
 
 
-FAIL_ON_CHOICES = ("secrets", "cves", "hidden-endpoints", "retire", "semgrep", "dom")
+FAIL_ON_CHOICES = ("secrets", "cves", "hidden-endpoints", "retire", "semgrep", "dom", "dep-confusion")
 
 
 
@@ -277,6 +285,19 @@ def main():
         help="Scan for leaked keys, tokens, passwords")
     ana.add_argument("--cve", action="store_true",
         help="Fingerprint library versions in the JS and check OSV.dev for known CVEs")
+    ana.add_argument("--graphql", action="store_true",
+        help="Extract GraphQL operations, fragments and client endpoints from the JS")
+    ana.add_argument("--graphql-introspect", action="store_true",
+        help="Also send an introspection query to each in-scope GraphQL endpoint found (active; live mode only)")
+    ana.add_argument("--config", action="store_true",
+        help="Extract embedded config objects, feature flags, internal hosts, cloud resources, env-var names")
+    ana.add_argument("--replay", action="store_true",
+        help="Emit replay-ready artefacts from the endpoints: openapi.json, curl_commands.sh, ffuf_commands.sh")
+    ana.add_argument("--source-intel", action="store_true",
+        help="From (recovered) first-party code: package list, project tree, dev emails and TODO/FIXME notes")
+    ana.add_argument("--dep-confusion", action="store_true",
+        help="Check each imported package against the public npm registry; flag unpublished (claimable) "
+             "names — dependency-confusion candidates (implies --source-intel; active npm lookups)")
     ana.add_argument("--wappalyzer", action="store_true",
         help="Run wappalyzer CLI for overall tech-stack fingerprinting (requires: npm install -g wappalyzer)")
     ana.add_argument("--retire", action="store_true",
@@ -294,7 +315,9 @@ def main():
              "LinkFinder per file). Default: per-tool (60-300s). On timeout, partial katana/gau/httpx "
              "output is kept.")
     ana.add_argument("--all-analysis", action="store_true",
-        help="Enable --endpoints, --params, --secrets, --cve, --wappalyzer, --retire, --semgrep, and --linkfinder together")
+        help="Enable all static analysis: --endpoints, --params, --secrets, --cve, --graphql, --config, "
+             "--replay, --source-intel, --wappalyzer, --retire, --semgrep, --linkfinder. "
+             "The active-network extras (--dep-confusion, --graphql-introspect) stay opt-in")
 
     # Output
     out = parser.add_argument_group("Output")
@@ -405,11 +428,21 @@ def _apply_analysis_flags(args, fail_on: list) -> None:
     produces X (otherwise a CI gate would silently always pass)."""
     if args.all_analysis:
         args.endpoints = args.params = args.secrets = args.cve = args.dom = True
+        # Static new analyzers only. The active-network extras (npm dependency-
+        # confusion lookups, GraphQL introspection against the target) stay
+        # opt-in so --all-analysis never fires unexpected outbound requests.
+        args.graphql = args.config = args.replay = args.source_intel = True
         args.wappalyzer = args.retire = args.semgrep = args.linkfinder = True
     for f, flag in (("secrets", "secrets"), ("cves", "cve"), ("hidden-endpoints", "endpoints"), ("dom", "dom"),
-                    ("retire", "retire"), ("semgrep", "semgrep")):
+                    ("retire", "retire"), ("semgrep", "semgrep"), ("dep-confusion", "dep_confusion")):
         if f in fail_on:
             setattr(args, flag, True)
+    # --dep-confusion needs the package list that --source-intel builds; --replay
+    # is most useful with endpoints/params, so turn those on too.
+    if args.dep_confusion:
+        args.source_intel = True
+    if args.replay:
+        args.endpoints = True
 
 
 def _run(args, parser, fail_on: list, json_stream) -> int:
@@ -851,6 +884,21 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         merged_path.write_text(banner + "".join(all_contents_merge), encoding="utf-8")
         print(f"\n{green('[*]')} Merged -> {merged_path}")
 
+    # GraphQL introspection probe: POST the introspection query to an in-scope
+    # endpoint using the scoped session. Active, so only wired for the live run.
+    def _gql_probe(url):
+        full = urljoin(resp.url or args.url, url)
+        if not scope.allows(full):
+            return None
+        try:
+            r = session.post(full, json={"query": INTROSPECTION_QUERY},
+                             headers={"Content-Type": "application/json"}, timeout=15)
+            if r.status_code != 200:
+                return None
+            return parse_introspection(r.json())
+        except Exception:
+            return None
+
     # ── Hand off to the shared analysis + reporting stage ─────────────────────
     ctx = {
         "started": started, "output_dir": output_dir, "base_html": base_html,
@@ -860,6 +908,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         "wayback_stats": wayback_stats, "archived": archived, "out_of_scope": out_of_scope,
         "skipped": skipped, "vite_sources": vite_sources, "tool_timeout": tool_timeout,
         "final_url": resp.url, "scope_desc": scope.describe(), "target": args.url,
+        "gql_probe": _gql_probe,
     }
     return _analyze_and_report(args, fail_on, json_stream, ctx)
 
@@ -931,7 +980,7 @@ def _run_input_dir(args, parser, fail_on: list, json_stream) -> int:
         "skipped": {"failed": [], "too_large": [], "not_javascript": [], "max_files": [], "guess_missed": []},
         "vite_sources": [], "tool_timeout": tool_timeout,
         "final_url": f"local:{in_dir}", "scope_desc": "local files (no network)",
-        "target": f"local:{in_dir}",
+        "target": f"local:{in_dir}", "gql_probe": None,
     }
     return _analyze_and_report(args, fail_on, json_stream, ctx)
 
@@ -1177,6 +1226,103 @@ def _analyze_and_report(args, fail_on: list, json_stream, ctx: dict) -> int:
             lf_path.write_text("\n".join(lf_endpoints), encoding="utf-8")
             print(f"  Saved -> {lf_path}")
 
+    # ── GraphQL operations, fragments, endpoints (+ optional introspection) ───
+    report_data["graphql"] = {"operations": [], "fragments": [], "endpoints": []}
+    report_data["graphql_schemas"] = []
+    if args.graphql and analysis_files:
+        print(f"\n{bold('[GraphQL]')} Extracting operations and endpoints...")
+        gql = find_graphql_in_files(analysis_files)
+        report_data["graphql"] = gql
+        (output_dir / "graphql.json").write_text(json.dumps(gql, indent=2, ensure_ascii=False), encoding="utf-8")
+        ops = gql["operations"]
+        by_type = {t: sum(1 for o in ops if o["type"] == t) for t in ("query", "mutation", "subscription")}
+        print(f"  {green(str(len(ops)))} operation(s) "
+              f"({by_type['query']} query, {by_type['mutation']} mutation, {by_type['subscription']} subscription), "
+              f"{len(gql['fragments'])} fragment(s), {len(gql['endpoints'])} endpoint(s)")
+        for o in ops[:15]:
+            print(f"    {cyan(o['type'])} {o['name']}  → {', '.join(o['fields'][:6])}  {o['file']}:{o['line']}")
+        probe = ctx.get("gql_probe")
+        if args.graphql_introspect and probe and gql["endpoints"]:
+            print(f"  {bold('[GraphQL]')} Trying introspection on {len(gql['endpoints'])} endpoint(s)...")
+            for ep in gql["endpoints"]:
+                schema = probe(ep["url"])
+                if schema:
+                    schema["endpoint"] = ep["url"]
+                    report_data["graphql_schemas"].append(schema)
+                    print(f"    {red('[introspection OPEN]')} {ep['url']}  "
+                          f"({schema['type_count']} types, query={schema['query_type']})")
+            if report_data["graphql_schemas"]:
+                (output_dir / "graphql_schema.json").write_text(
+                    json.dumps(report_data["graphql_schemas"], indent=2, ensure_ascii=False), encoding="utf-8")
+        elif args.graphql_introspect and not probe:
+            print(f"  {yellow('[WARN]')} --graphql-introspect needs a live target; ignored for --input-dir")
+
+    # ── Embedded config / feature flags / internal hosts / cloud resources ────
+    report_data["config"] = []
+    if args.config and analysis_files:
+        print(f"\n{bold('[Config]')} Extracting embedded configuration...")
+        cfg = find_config_in_files(analysis_files)
+        report_data["config"] = cfg
+        (output_dir / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        counts = {}
+        for c in cfg:
+            counts[c["kind"]] = counts.get(c["kind"], 0) + 1
+        print("  " + ", ".join(f"{green(str(v))} {k}" for k, v in counts.items()) if cfg
+              else "  Nothing notable found.")
+        for c in [c for c in cfg if c["kind"] in ("internal-host", "cloud-resource")][:12]:
+            print(f"    {yellow(c['kind'])}: {c['value']}  {c['file']}:{c['line']}")
+
+    # ── Source intelligence + dependency confusion ───────────────────────────
+    report_data["source_intel"] = {"packages": [], "emails": [], "todos": [], "tree": [], "tree_count": 0}
+    report_data["dep_confusion"] = []
+    if args.source_intel and analysis_files:
+        print(f"\n{bold('[SourceIntel]')} Mining first-party code...")
+        source_paths = []
+        for idx in output_dir.rglob("_sources.txt"):
+            try:
+                source_paths += [ln.strip() for ln in idx.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            except OSError:
+                pass
+        si = find_source_intel(analysis_files, source_paths)
+        report_data["source_intel"] = si
+        (output_dir / "source_intel.json").write_text(json.dumps(si, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"  {green(str(len(si['packages'])))} package(s), {si['tree_count']} first-party source path(s), "
+              f"{len(si['emails'])} email(s), {len(si['todos'])} TODO/FIXME note(s)")
+        for t in si["todos"][:8]:
+            print(f"    {yellow(t['tag'])} {t['file']}:{t['line']}  {t['text']}")
+
+        if args.dep_confusion and si["packages"]:
+            print(f"  {bold('[DepConfusion]')} Checking {len(si['packages'])} package(s) against the npm registry...")
+            dep = check_npm_packages(si["packages"])
+            report_data["dep_confusion"] = dep
+            (output_dir / "dep_confusion.json").write_text(json.dumps(dep, indent=2, ensure_ascii=False), encoding="utf-8")
+            claimable = [d for d in dep if d["status"] == "claimable"]
+            if claimable:
+                print(f"    {red('[!] ' + str(len(claimable)) + ' claimable (unpublished) package(s):')}")
+                for d in claimable:
+                    print(f"      {red(d['name'])}  (risk {d['risk']}{' · scoped' if d['scoped'] else ''})")
+            else:
+                print(f"    {green('All packages are published on npm (no dependency-confusion candidates).')}")
+
+    # ── Replay-ready artefacts (OpenAPI, curl, ffuf) ──────────────────────────
+    report_data["replay"] = {}
+    if args.replay and report_data.get("endpoint_details"):
+        print(f"\n{bold('[Replay]')} Building replay-ready artefacts...")
+        eps = report_data["endpoint_details"]
+        headers = build_auth_headers(args)
+        cookie = "; ".join(f"{k}={v}" for k, v in build_cookies(args).items())
+        openapi = build_openapi(eps, report_data.get("params", []), final_url)
+        curls = build_curl_commands(eps, final_url, headers, cookie)
+        ffufs = build_ffuf_commands(eps, final_url)
+        (output_dir / "openapi.json").write_text(json.dumps(openapi, indent=2, ensure_ascii=False), encoding="utf-8")
+        (output_dir / "curl_commands.sh").write_text("#!/bin/sh\n" + "\n".join(curls) + "\n", encoding="utf-8")
+        (output_dir / "ffuf_commands.sh").write_text("#!/bin/sh\n" + "\n".join(ffufs) + "\n", encoding="utf-8")
+        report_data["replay"] = {"openapi_paths": len(openapi.get("paths", {})),
+                                 "curl_commands": len(curls), "ffuf_commands": len(ffufs),
+                                 "servers": [s["url"] for s in openapi.get("servers", [])]}
+        print(f"  openapi.json ({len(openapi.get('paths', {}))} path(s)), "
+              f"curl_commands.sh ({len(curls)}), ffuf_commands.sh ({len(ffufs)}) -> {output_dir}")
+
     # HTML report
     if args.report:
         rpath = generate_report(report_data, output_dir)
@@ -1191,6 +1337,7 @@ def _analyze_and_report(args, fail_on: list, json_stream, ctx: dict) -> int:
         "dom": sum(1 for d in report_data.get("dom_findings", []) if d["severity"] == "high"),
         "retire": sum(len(r["vulnerabilities"]) for r in report_data.get("retire_findings", [])),
         "semgrep": len(report_data.get("semgrep_findings", [])),
+        "dep-confusion": sum(1 for d in report_data.get("dep_confusion", []) if d["status"] == "claimable"),
     }
     results = {
         "tool": "js-extractor",
@@ -1226,6 +1373,12 @@ def _analyze_and_report(args, fail_on: list, json_stream, ctx: dict) -> int:
         "retire_findings": report_data.get("retire_findings", []),
         "semgrep_findings": report_data.get("semgrep_findings", []),
         "linkfinder_endpoints": report_data.get("linkfinder_endpoints", []),
+        "graphql": report_data.get("graphql", {}),
+        "graphql_schemas": report_data.get("graphql_schemas", []),
+        "config": report_data.get("config", []),
+        "source_intel": report_data.get("source_intel", {}),
+        "dep_confusion": report_data.get("dep_confusion", []),
+        "replay": report_data.get("replay", {}),
         "routes": sorted(routes),
         "archived": archived,
         "vite_manifest_sources": vite_sources,
