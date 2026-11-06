@@ -171,12 +171,23 @@ def generate_report(data: dict, out_dir: Path) -> Path:
         if lib_rows else "<i>No version-fingerprinted libraries detected (use --cve)</i>"
     )
 
+    cve_sev_colour = {"critical": "#7f1d1d", "high": "#dc2626", "medium": "#d97706",
+                      "moderate": "#d97706", "low": "#64748b", "none": "#94a3b8"}
+    # Worst first: by numeric CVSS where we have it, then the rest.
+    cves_sorted = sorted(data.get("cves", []),
+                         key=lambda c: c.get("cvss_score") if c.get("cvss_score") is not None else -1,
+                         reverse=True)
     cve_detail_rows = ""
-    for c in data.get("cves", []):
+    for c in cves_sorted:
+        sev = c.get("severity", "")
+        score = c.get("cvss_score")
+        sev_cell = (badge(f"{sev} {score}" if score is not None else sev,
+                          cve_sev_colour.get(sev.lower(), "#d97706"))
+                    if sev else "<i>n/a</i>")
         cve_detail_rows += f"""<tr>
           <td style="padding:5px">{badge(c['cve'] or c['id'], '#dc2626')}</td>
           <td style="padding:5px;font-family:monospace">{e(c['library'])}@{e(c['version'])}</td>
-          <td style="padding:5px">{e(c['severity']) if c['severity'] else '<i>n/a</i>'}</td>
+          <td style="padding:5px">{sev_cell}</td>
           <td style="padding:5px;font-size:12px">{e(c['summary'])}</td>
           <td style="padding:5px"><a href="{safe_href(c['url'])}" target="_blank" rel="noopener noreferrer">osv.dev</a></td>
         </tr>"""

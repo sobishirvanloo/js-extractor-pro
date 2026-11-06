@@ -20,7 +20,10 @@ Features:
   - HTML report generation
 
 Usage:
-  python3 js_extractor.py <url> [options]
+  js-extractor <url> [options]              (installed console script)
+  python3 -m js_extractor.cli <url> [options]
+  python3 -m js_extractor.cli -l targets.txt [options]        (batch)
+  python3 -m js_extractor.cli --input-dir ./js [options]      (local, no network)
 
 Auth:
   --cookie "name=value; name2=value2"
@@ -63,7 +66,9 @@ Output:
 
 import argparse
 import contextlib
+import hashlib
 import json
+import re
 import sys
 import threading
 import time
@@ -161,8 +166,15 @@ def main():
         description="JS Extractor v2 — extract, beautify, and analyze all JS from a web page",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    # Target
-    parser.add_argument("url", help="Target page URL")
+    # Target (exactly one of: a URL, --list, or --input-dir)
+    parser.add_argument("url", nargs="?", default=None,
+        help="Target page URL (omit when using --list or --input-dir)")
+    parser.add_argument("-l", "--list", default=None, metavar="FILE",
+        help="Scan every URL in FILE (one per line, '#' comments allowed); '-' reads stdin. "
+             "Each target gets its own sub-directory under --output-dir")
+    parser.add_argument("--input-dir", default=None, metavar="DIR",
+        help="Skip all network activity and analyze .js files already on disk under DIR "
+             "(re-analyze a previous download, or files saved by hand)")
 
     # Auth
     auth = parser.add_argument_group("Authentication")
@@ -196,6 +208,9 @@ def main():
         help="Max requests per second across all threads, 0 = unlimited (default: 10)")
     perf.add_argument("--max-files", type=int, default=0, metavar="N",
         help="Download at most N external scripts, 0 = unlimited (default). Useful with --gau")
+    perf.add_argument("--max-beautify-size", type=float, default=2, metavar="MB",
+        help="Fully beautify files up to this size; larger ones get a fast line-split instead "
+             "(0 = always beautify). Default 2")
     perf.add_argument("--max-size", type=float, default=30, metavar="MB",
         help="Skip any response larger than this, 0 = unlimited (default: 30 MB)")
 
@@ -254,7 +269,7 @@ def main():
     ana.add_argument("--endpoints", action="store_true",
         help="Extract API endpoints (includes hidden/internal detection)")
     ana.add_argument("--params", action="store_true",
-        help="Extract parameters for fuzzing; saves params.txt wordlist")
+        help="Extract parameters for fuzzing; saves params_wordlist.txt")
     ana.add_argument("--dom", action="store_true",
         help="Map DOM XSS sinks (innerHTML, eval, location, ...), sources (location.hash, ...) and "
              "postMessage handlers without origin checks, ranked by source→sink flow; saves dom_sinks.json")
@@ -304,38 +319,104 @@ def main():
         parser.error(f"--fail-on: unknown value(s) {', '.join(bad)}; choose from {', '.join(FAIL_ON_CHOICES)}")
     if not 1 <= args.threads <= 64:
         parser.error("--threads must be between 1 and 64")
-    if args.rate_limit < 0 or args.max_files < 0 or args.max_size < 0:
-        parser.error("--rate-limit, --max-files and --max-size must not be negative")
+    if args.rate_limit < 0 or args.max_files < 0 or args.max_size < 0 or args.max_beautify_size < 0:
+        parser.error("--rate-limit, --max-files, --max-size and --max-beautify-size must not be negative")
     if args.wayback_max < 1:
         parser.error("--wayback-max must be at least 1")
 
-    # --json: stdout carries only the JSON document; all progress → stderr
-    if args.json:
-        json_stream = sys.stdout
-        with contextlib.redirect_stdout(sys.stderr):
-            code = _run(args, parser, fail_on, json_stream)
-    else:
-        code = _run(args, parser, fail_on, None)
+    # Exactly one way to say what to scan.
+    chosen = [bool(args.url), bool(args.list), bool(args.input_dir)]
+    if sum(chosen) != 1:
+        parser.error("provide exactly one of: a target URL, --list FILE, or --input-dir DIR")
+
+    try:
+        if args.input_dir:
+            code = _dispatch(args, parser, fail_on, _run_input_dir)
+        elif args.list:
+            code = _run_many(args, parser, fail_on)
+        else:
+            code = _dispatch(args, parser, fail_on, _run)
+    except KeyboardInterrupt:
+        # Clean exit instead of a traceback; 130 = terminated by SIGINT.
+        print(f"\n{red('[Aborted]')} interrupted by user (Ctrl+C)", file=sys.stderr)
+        code = 130
     if code:
         sys.exit(code)
 
+
+def _dispatch(args, parser, fail_on: list, runner) -> int:
+    """Run one target through `runner`, honouring --json (JSON to stdout,
+    all progress to stderr)."""
+    if args.json:
+        json_stream = sys.stdout
+        with contextlib.redirect_stdout(sys.stderr):
+            return runner(args, parser, fail_on, json_stream)
+    return runner(args, parser, fail_on, None)
+
+
+def _is_http_url(url: str) -> bool:
+    p = urlparse(url)
+    return p.scheme in ("http", "https") and bool(p.hostname)
+
+
+def _safe_target_dir(url: str) -> str:
+    """Per-target output sub-directory name: readable host + short hash so two
+    URLs on the same host (different paths) don't collide."""
+    host = urlparse(url).hostname or "target"
+    label = re.sub(r"[^\w.\-]", "_", host)[:60]
+    return f"{label}_{hashlib.sha1(url.encode()).hexdigest()[:8]}"
+
+
+def _read_target_list(src: str, parser) -> list[str]:
+    try:
+        raw = sys.stdin.read() if src == "-" else Path(src).read_text(encoding="utf-8")
+    except OSError as e:
+        parser.error(f"--list: cannot read {src}: {e}")
+    targets = [ln.strip() for ln in raw.splitlines()]
+    targets = [t for t in targets if t and not t.startswith("#")]
+    if not targets:
+        parser.error("--list: no targets found in file")
+    return list(dict.fromkeys(targets))      # de-dupe, keep order
+
+
+def _run_many(args, parser, fail_on: list) -> int:
+    """Batch mode: scan every URL in --list, each into its own sub-directory.
+    Returns the worst per-target exit code (3 > 2 > 1 > 0)."""
+    targets = _read_target_list(args.list, parser)
+    base_out = Path(args.output_dir)
+    prog = sys.stderr if args.json else sys.stdout
+    print(f"{bold('[*]')} Batch mode: {len(targets)} target(s) -> {base_out}/<host>", file=prog)
+    worst = 0
+    for i, t in enumerate(targets, 1):
+        print(f"\n{'#' * 64}\n# [{i}/{len(targets)}] {cyan(t)}\n{'#' * 64}", file=prog)
+        if not _is_http_url(t):
+            print(f"{yellow('[SKIP]')} not an absolute http(s) URL: {t!r}", file=prog)
+            worst = max(worst, 2)
+            continue
+        args.url = t
+        args.output_dir = str(base_out / _safe_target_dir(t))
+        worst = max(worst, _dispatch(args, parser, fail_on, _run))
+    return worst
+
+
+
+def _apply_analysis_flags(args, fail_on: list) -> None:
+    """Expand --all-analysis, and make --fail-on X imply the analysis that
+    produces X (otherwise a CI gate would silently always pass)."""
+    if args.all_analysis:
+        args.endpoints = args.params = args.secrets = args.cve = args.dom = True
+        args.wappalyzer = args.retire = args.semgrep = args.linkfinder = True
+    for f, flag in (("secrets", "secrets"), ("cves", "cve"), ("hidden-endpoints", "endpoints"), ("dom", "dom"),
+                    ("retire", "retire"), ("semgrep", "semgrep")):
+        if f in fail_on:
+            setattr(args, flag, True)
 
 
 def _run(args, parser, fail_on: list, json_stream) -> int:
     """Everything after argument parsing. Returns the process exit code."""
     started = time.monotonic()
 
-    # --all-analysis shortcut
-    if args.all_analysis:
-        args.endpoints = args.params = args.secrets = args.cve = args.dom = True
-        args.wappalyzer = args.retire = args.semgrep = args.linkfinder = True
-
-    # --fail-on X implies the analysis that produces X (otherwise it could
-    # never trigger and a CI gate would silently always pass)
-    for f, flag in (("secrets", "secrets"), ("cves", "cve"), ("hidden-endpoints", "endpoints"), ("dom", "dom"),
-                    ("retire", "retire"), ("semgrep", "semgrep")):
-        if f in fail_on:
-            setattr(args, flag, True)
+    _apply_analysis_flags(args, fail_on)
 
     if args.tool_timeout is not None and args.tool_timeout <= 0:
         parser.error("--tool-timeout must be a positive number of seconds")
@@ -368,6 +449,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
 
     limiter = RateLimiter(args.rate_limit)
     max_bytes = int(args.max_size * 1048576) if args.max_size else 0
+    max_beautify_bytes = int(args.max_beautify_size * 1048576) if args.max_beautify_size else 0
     session = make_session(args, scope, limiter, max_bytes)
     if args.insecure:
         import urllib3
@@ -594,7 +676,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
                 }
             return {
                 "idx": idx, "url": src_url, "guess": is_guess, "error": None,
-                "beautified": beautify(raw),
+                "beautified": beautify(raw, max_beautify_bytes),
                 "recovered": recovered,
                 "imports": [] if args.no_imports else find_js_imports(raw, src_url),
                 "workers": [] if args.no_workers else find_workers(raw, src_url),
@@ -704,7 +786,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
                 if not got:
                     continue
                 print(f"  {green('[Archived]')} {url}  (snapshot {got['snapshot']})")
-                beautified = beautify(got["text"])
+                beautified = beautify(got["text"], max_beautify_bytes)
                 all_js_text += beautified + "\n"
                 fname = safe_filename(url, prefix=f"wb_{i:03d}")
                 fpath = arch_dir / fname
@@ -742,7 +824,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         inline_dir = output_dir / "inline"
         print(f"\n{bold('[*]')} Saving {len(all_inline)} inline block(s)...")
         for i, code in enumerate(all_inline, 1):
-            beautified = beautify(code)
+            beautified = beautify(code, max_beautify_bytes)
             all_js_text += beautified + "\n"
             fname = f"inline_{i:03d}.js"
             fpath = inline_dir / fname
@@ -769,12 +851,117 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         merged_path.write_text(banner + "".join(all_contents_merge), encoding="utf-8")
         print(f"\n{green('[*]')} Merged -> {merged_path}")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Analysis phase
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Hand off to the shared analysis + reporting stage ─────────────────────
+    ctx = {
+        "started": started, "output_dir": output_dir, "base_html": base_html,
+        "file_records": file_records, "analysis_files": analysis_files,
+        "all_js_text": all_js_text, "recovered_paths": recovered_paths,
+        "routes": routes, "chunk_stats": chunk_stats, "wappalyzer_techs": wappalyzer_techs,
+        "wayback_stats": wayback_stats, "archived": archived, "out_of_scope": out_of_scope,
+        "skipped": skipped, "vite_sources": vite_sources, "tool_timeout": tool_timeout,
+        "final_url": resp.url, "scope_desc": scope.describe(), "target": args.url,
+    }
+    return _analyze_and_report(args, fail_on, json_stream, ctx)
+
+
+def _run_input_dir(args, parser, fail_on: list, json_stream) -> int:
+    """Analyze .js files already on disk — no network, no discovery. Each file
+    is beautified into <output-dir>/local/ and run through the same analyzers
+    as the live crawl, so endpoint/secret/DOM findings point at a real file:line."""
+    started = time.monotonic()
+    _apply_analysis_flags(args, fail_on)
+
+    in_dir = Path(args.input_dir)
+    if not in_dir.is_dir():
+        parser.error(f"--input-dir not found or not a directory: {args.input_dir}")
+    if args.tool_timeout is not None and args.tool_timeout <= 0:
+        parser.error("--tool-timeout must be a positive number of seconds")
+    tool_timeout = {"timeout": args.tool_timeout} if args.tool_timeout else {}
+    max_beautify_bytes = int(args.max_beautify_size * 1048576) if args.max_beautify_size else 0
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    local_dir = output_dir / "local"
+    local_root = local_dir.resolve()
+
+    # Gather the source list up front so the beautified copies we write into
+    # output_dir/local/ aren't re-ingested when --input-dir points at (or above)
+    # --output-dir.
+    exts = {".js", ".mjs", ".cjs"}
+    src_files = sorted(p for p in in_dir.rglob("*")
+                       if p.is_file() and p.suffix.lower() in exts
+                       and local_root not in p.resolve().parents)
+    if not src_files:
+        parser.error(f"--input-dir: no .js/.mjs/.cjs files found under {in_dir}")
+
+    print(f"\n{bold('[*]')} Local analysis of {cyan(str(in_dir))} — "
+          f"{len(src_files)} JS file(s), no network\n")
+
+    analysis_files, file_records, all_js_text = [], [], ""
+    for i, sp in enumerate(src_files, 1):
+        try:
+            raw = sp.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"  {yellow('[SKIP]')} {sp}: {e}")
+            continue
+        beautified = beautify(raw, max_beautify_bytes)
+        all_js_text += beautified + "\n"
+        rel = re.sub(r"[^\w.\-]", "_", str(sp.relative_to(in_dir)))
+        fname = f"local_{i:03d}_{rel}"
+        if not fname.endswith((".js", ".mjs", ".cjs")):
+            fname += ".js"
+        fpath = local_dir / fname
+        header_lines = save_js(beautified, fpath, url=str(sp))
+        analysis_files.append((str(fpath.relative_to(output_dir)), beautified, header_lines))
+        file_records.append({"kind": "local", "filename": fname, "url": str(sp),
+                             "saved_path": str(fpath.relative_to(output_dir)),
+                             "size_kb": fpath.stat().st_size / 1024})
+
+    if not analysis_files:
+        print(f"{red('[!]')} No readable JS files; nothing to analyze.")
+        return 1
+
+    ctx = {
+        "started": started, "output_dir": output_dir, "base_html": "",
+        "file_records": file_records, "analysis_files": analysis_files,
+        "all_js_text": all_js_text, "recovered_paths": [],
+        "routes": set(), "chunk_stats": {"webpack_runtimes": 0, "candidates": 0, "found": 0},
+        "wappalyzer_techs": [], "wayback_stats": {"candidates": 0, "found": 0},
+        "archived": [], "out_of_scope": [],
+        "skipped": {"failed": [], "too_large": [], "not_javascript": [], "max_files": [], "guess_missed": []},
+        "vite_sources": [], "tool_timeout": tool_timeout,
+        "final_url": f"local:{in_dir}", "scope_desc": "local files (no network)",
+        "target": f"local:{in_dir}",
+    }
+    return _analyze_and_report(args, fail_on, json_stream, ctx)
+
+
+def _analyze_and_report(args, fail_on: list, json_stream, ctx: dict) -> int:
+    """Shared analysis + reporting stage: run the configured analyzers over a
+    corpus of JS files and write results.json / the HTML report. Used by both
+    the live crawl (_run) and local-only analysis (_run_input_dir)."""
+    started = ctx["started"]
+    output_dir = ctx["output_dir"]
+    base_html = ctx["base_html"]
+    file_records = ctx["file_records"]
+    analysis_files = ctx["analysis_files"]
+    all_js_text = ctx["all_js_text"]
+    recovered_paths = ctx["recovered_paths"]
+    routes = ctx["routes"]
+    chunk_stats = ctx["chunk_stats"]
+    wappalyzer_techs = ctx["wappalyzer_techs"]
+    wayback_stats = ctx["wayback_stats"]
+    archived = ctx["archived"]
+    out_of_scope = ctx["out_of_scope"]
+    skipped = ctx["skipped"]
+    vite_sources = ctx["vite_sources"]
+    tool_timeout = ctx["tool_timeout"]
+    final_url = ctx["final_url"]
+    scope_desc = ctx["scope_desc"]
+    target = ctx["target"]
 
     report_data = {
-        "target_url": args.url,
+        "target_url": target,
         "total_files": len(file_records),
         "total_size_kb": sum(f["size_kb"] for f in file_records),
         "files": file_records,
@@ -910,7 +1097,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
     report_data["cves"] = []
     if args.cve and fingerprint_text:
         print(f"\n{bold('[CVE]')} Fingerprinting library versions...")
-        libs = detect_library_versions(fingerprint_text)
+        libs = detect_library_versions(fingerprint_text, urls=[f["url"] for f in file_records])
         report_data["libraries"] = libs
 
         if not libs:
@@ -927,10 +1114,12 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
 
             cve_path = output_dir / "cve_report.txt"
             with cve_path.open("w", encoding="utf-8") as f:
-                for c in cves:
+                for c in sorted(cves, key=lambda c: c.get("cvss_score") if c.get("cvss_score") is not None else -1,
+                                reverse=True):
                     label = c["cve"] or c["id"]
-                    f.write(f"{c['library']}@{c['version']}  {label}  "
-                            f"(severity: {c['severity'] or 'n/a'})\n"
+                    score = c.get("cvss_score")
+                    sev = (f"{c['severity']} {score}" if score is not None else c["severity"]) or "n/a"
+                    f.write(f"{c['library']}@{c['version']}  {label}  (severity: {sev})\n"
                             f"  {c['summary']}\n  {c['url']}\n\n")
 
             if cves:
@@ -1007,9 +1196,9 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         "tool": "js-extractor",
         "version": __version__,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "target": args.url,
-        "final_url": resp.url,
-        "scope": {"mode": args.scope, "allowed": scope.describe(), "auth_scope": args.auth_scope},
+        "target": target,
+        "final_url": final_url,
+        "scope": {"mode": args.scope, "allowed": scope_desc, "auth_scope": args.auth_scope},
         "stats": {
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "external_downloaded": sum(1 for f in file_records if f["kind"] == "external"),
@@ -1060,8 +1249,9 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
     print(f"    Output dir: {output_dir.resolve()}")
     print(f"    Results:    {results_path}")
     print(f"{'─'*55}")
-    print(f"{cyan('[Manual step]')} Live source→sink tracing (DOM Invader in Burp Suite) "
-          f"isn't automatable — load {args.url} in a Burp-proxied browser with DOM Invader "
+    if final_url.startswith("http"):
+        print(f"{cyan('[Manual step]')} Live source→sink tracing (DOM Invader in Burp Suite) "
+          f"isn't automatable — load {final_url} in a Burp-proxied browser with DOM Invader "
           f"enabled and use the beautified JS + endpoints/params above as your map.\n")
 
     triggered = [f for f in fail_on if hits.get(f)]
@@ -1069,6 +1259,8 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
         print(f"{red('[FAIL]')} --fail-on matched: " + ", ".join(f"{f} ({hits[f]})" for f in triggered))
         return 3
     return 0
+
+
 
 
 

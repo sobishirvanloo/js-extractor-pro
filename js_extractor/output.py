@@ -2,6 +2,7 @@
 Beautifying and writing scripts and machine-readable results to disk.
 """
 import json
+import re
 from pathlib import Path
 
 import jsbeautifier
@@ -9,8 +10,33 @@ import jsbeautifier
 from .ui import green
 
 
-def beautify(js_code: str) -> str:
-    """Prettify minified JavaScript with js-beautifier."""
+# jsbeautifier is a pure-Python reformatter: on a multi-megabyte bundle it can
+# take minutes (and a lot of RAM). Above this many bytes we skip the full
+# reformat and do a cheap newline split instead — enough to make regex analysis
+# line-aware without stalling the run. Tunable via --max-beautify-size.
+DEFAULT_MAX_BEAUTIFY_BYTES = 2_000_000
+
+# Split after statement/block boundaries, but only when they're followed by a
+# non-newline — a fast approximation of beautify for oversized files.
+_LIGHT_SPLIT = re.compile(r'([;{}])(?=\S)')
+
+
+def light_prettify(js_code: str) -> str:
+    """Cheap line-splitter for files too big to fully beautify. Best-effort:
+    it can split inside a string literal, so it's only used past the size cap
+    where a full reformat would be prohibitively slow."""
+    return ("/* note: file exceeded beautify size cap — lightly prettified "
+            "(line splits are approximate) */\n") + _LIGHT_SPLIT.sub(r"\1\n", js_code)
+
+
+def beautify(js_code: str, max_bytes: int = DEFAULT_MAX_BEAUTIFY_BYTES) -> str:
+    """Prettify minified JavaScript with js-beautifier.
+
+    Files larger than ``max_bytes`` (0 disables the cap) get the cheap
+    ``light_prettify`` treatment instead, so one giant bundle can't hang the
+    whole run."""
+    if max_bytes and len(js_code) > max_bytes:
+        return light_prettify(js_code)
     opts = jsbeautifier.default_options()
     opts.indent_size = 2
     opts.max_preserve_newlines = 2

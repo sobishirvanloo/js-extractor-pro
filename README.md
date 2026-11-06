@@ -73,7 +73,10 @@ scanning, framework fingerprinting, and known-CVE lookups.
   - Each finding has a severity, a confidence and a **trace** — e.g.
     `location (L10) → a1 (L10) → b1 (L11) → c1 (L12) → innerHTML (L13)`. `dom_sources.json` lists
     every source read.
-- Library version fingerprinting + CVE lookup via [OSV.dev](https://osv.dev) — `--cve`
+- Library version fingerprinting + CVE lookup via [OSV.dev](https://osv.dev) — `--cve`: versions
+  come from both banner comments and versioned filenames (`jquery-3.5.1.min.js`); all libraries are
+  resolved in a single batched OSV query, and each CVE is given a numeric CVSS base score and a
+  NONE/LOW/MEDIUM/HIGH/CRITICAL band so findings sort and feed `--fail-on cves`
 - Optional integrations: `wappalyzer`, `retire.js`, `semgrep`, `LinkFinder`
 - HTML analysis report generation — `--report`
 
@@ -173,6 +176,25 @@ Or, without installing:
 python3 js_extractor/cli.py <url> [options]
 ```
 
+### Targets: one URL, a list, or local files
+
+Give exactly one of these:
+
+```bash
+js-extractor https://example.com [options]        # a single URL
+js-extractor -l targets.txt [options]             # one URL per line ('#' comments ok; '-' = stdin)
+js-extractor --input-dir ./some_js_dir [options]  # analyze .js already on disk, no network
+```
+
+- **`-l, --list FILE`** — batch mode. Every URL is scanned into its own sub-directory under
+  `--output-dir` (`<output-dir>/<host>_<hash>/`). Invalid lines are skipped; the exit code is the
+  worst seen across all targets. With `--json`, one results document is printed per target.
+- **`--input-dir DIR`** — re-analyze JS you already have (a previous download, files pulled by hand,
+  an unpacked bundle). It skips all network/discovery, beautifies each `.js`/`.mjs`/`.cjs` into
+  `<output-dir>/local/`, and runs the same analyzers — so `file:line` in findings points at a real
+  file. Network-only passes (`--dynamic`, `--katana`, `--gau`, `--wayback`, `--cve`, `--wappalyzer`)
+  don't apply here.
+
 ### Authentication
 
 ```bash
@@ -207,6 +229,8 @@ SOCKS proxies need `pip install "requests[socks]"`.
 --rate-limit RPS             # max requests/second across all threads, 0 = unlimited (default: 10)
 --max-files N                # download at most N external scripts, 0 = unlimited (default)
 --max-size MB                # skip any response larger than this, 0 = unlimited (default: 30)
+--max-beautify-size MB       # fully beautify files up to this size; bigger ones get a fast
+                             #   line-split instead, 0 = always beautify (default: 2)
 ```
 
 Output is identical from run to run regardless of thread timing (files are numbered in discovery
@@ -336,6 +360,7 @@ js-extractor https://target.com/dashboard \
 js_output/
 ├── external/                # Downloaded + beautified external .js files
 ├── inline/                  # Beautified inline <script> blocks
+├── local/                   # (with --input-dir) beautified copies of the local files analyzed
 ├── archived/                # (with --wayback) Wayback copies of scripts that are gone today
 ├── sourcemap_recovered/     # Original sources, one folder per bundle (+ _sources.txt index)
 ├── ALL_SCRIPTS_MERGED.js    # (with --merge)

@@ -1,11 +1,25 @@
 """
-Terminal colours (disabled when stdout is not a TTY, and on Windows).
+Terminal colours (disabled when stdout is not a TTY, on Windows, or when
+NO_COLOR is set — https://no-color.org).
 """
 import os
 import sys
 
 
-_USE_COLOR = sys.platform != "win32" and os.isatty(sys.stdout.fileno())
+def _supports_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if sys.platform == "win32":
+        return False
+    # stdout may be a pipe, a StringIO, or anything without a real fd (common
+    # under pytest capture, nohup, or some IDE consoles) — never crash on import.
+    try:
+        return os.isatty(sys.stdout.fileno())
+    except (AttributeError, ValueError, OSError):
+        return getattr(sys.stdout, "isatty", lambda: False)()
+
+
+_USE_COLOR = _supports_color()
 
 
 

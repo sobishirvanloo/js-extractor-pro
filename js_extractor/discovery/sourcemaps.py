@@ -136,7 +136,8 @@ def is_vendor_path(path: Path, root: Path) -> bool:
 
 def analysis_dirs(output_dir: Path) -> list[Path]:
     """Every output folder holding code worth scanning with external tools."""
-    dirs = [output_dir / "external", output_dir / "inline", output_dir / "sourcemap_recovered"]
+    dirs = [output_dir / "external", output_dir / "inline", output_dir / "sourcemap_recovered",
+            output_dir / "local"]       # "local" only exists under --input-dir
     return [d for d in dirs if d.is_dir() and any(d.iterdir())]
 
 
