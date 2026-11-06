@@ -3,15 +3,63 @@
 Extracts, beautifies, and analyzes **all** JavaScript from a web page — built for recon and
 front-end-heavy web application penetration testing.
 
-It pulls inline `<script>` blocks, external `.js` files, Web Worker / Service Worker code, and
-(optionally) chunks discovered via a headless browser, then beautifies everything and runs a
-suite of static-analysis checks: endpoint discovery, parameter extraction for fuzzing, secret
-scanning, framework fingerprinting, and known-CVE lookups.
+It pulls inline `<script>` blocks, external `.js` files, Web Worker / Service Worker code, lazy
+webpack/Vite/Next.js chunks, source-map originals, and (optionally) code discovered via a headless
+browser, then beautifies everything and runs a suite of static-analysis checks: endpoint discovery,
+parameter extraction for fuzzing, secret scanning, framework fingerprinting, known-CVE lookups,
+DOM-XSS taint analysis, GraphQL operation/endpoint extraction, embedded-config and feature-flag
+mining, source intelligence with an npm dependency-confusion check, and replay-ready output
+(OpenAPI + curl + ffuf). It runs against a live URL, a list of URLs, or JS files already on disk,
+and ships as a Docker image so the only thing you install is Docker.
 
 > **Note:** live source→sink taint tracing (e.g. Burp Suite's DOM Invader) requires a human
 > driving a real browser and cannot be automated from the CLI. This tool prepares everything
 > DOM Invader needs — beautified JS, endpoints, and params — but the live-tracing step itself
 > stays manual.
+
+> ⚠️ **Authorized use only.** Run this against targets you own or have explicit written
+> permission to test (your own lab, a CTF, a bug-bounty scope). See [Disclaimer](#disclaimer).
+
+---
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Tutorial — your first scan, step by step](#tutorial--your-first-scan-step-by-step)
+- [Output structure](#output-structure)
+- [Project layout](#project-layout)
+- [Testing](#testing)
+- [Disclaimer](#disclaimer)
+- [License](#license)
+
+---
+
+## Quick start
+
+The fastest path, with nothing to install but Docker:
+
+```bash
+git clone https://github.com/sobishirvanloo/js-extractor-pro.git
+cd js-extractor-pro
+docker build -t js-extractor .
+
+# scan a target you're allowed to test; results land in ./out on your machine
+docker run --rm -v "$PWD/out:/work" js-extractor https://example.com --all-analysis --report
+open out/report.html     # macOS; use xdg-open on Linux, start on Windows
+```
+
+Prefer Python? With Python 3.9+:
+
+```bash
+pip install .
+js-extractor https://example.com --all-analysis --report --output-dir ./out
+```
+
+New here? Jump to the [step-by-step tutorial](#tutorial--your-first-scan-step-by-step).
 
 ---
 
@@ -171,6 +219,44 @@ python3 js_extractor/cli.py <url> [options]
 
 ```bash
 pip install -e .
+```
+
+### Option 4 — Docker (no prerequisites but Docker itself)
+
+Everything the core needs is baked into the image, so it runs the same on
+Linux, macOS and Windows with nothing to install on the host but Docker.
+
+```bash
+docker build -t js-extractor .
+
+# scan a URL; results land in ./out on the host (mounted at /work)
+docker run --rm -v "$PWD/out:/work" js-extractor https://example.com \
+    --all-analysis --report
+
+# keep output files owned by you instead of root
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/out:/work" \
+    js-extractor https://example.com --endpoints --json
+
+# analyze local files you drop into ./out  →  /work inside the container
+docker run --rm -v "$PWD/out:/work" js-extractor --input-dir /work/js --all-analysis
+```
+
+Or with Compose:
+
+```bash
+docker compose run --rm js-extractor https://example.com --all-analysis --report
+```
+
+The default image includes **all static and network analysis** (endpoints,
+params, secrets, DOM, CVE/OSV, GraphQL, config, replay, source-intel,
+dependency-confusion, wayback). It does **not** include the headless browser
+(`--dynamic`) or the external crawler binaries (katana/gau/httpx/retire/semgrep)
+— for those, build the larger optional image:
+
+```bash
+docker build -f Dockerfile.full -t js-extractor:full .
+docker run --rm -v "$PWD/out:/work" js-extractor:full https://example.com \
+    --all-analysis --dynamic --katana --gau --httpx-probe --retire --semgrep --report
 ```
 
 ---
@@ -369,6 +455,135 @@ js-extractor https://target.com/dashboard \
   --cookie "session=abc123" \
   --header "X-Custom-Header: value" \
   --endpoints --secrets --cve
+```
+
+---
+
+## Tutorial — your first scan, step by step
+
+This walkthrough takes you from zero to a full recon pass and shows you how to read
+every artefact. It assumes the Docker image is built (`docker build -t js-extractor .`);
+if you installed with pip instead, just drop the `docker run ... js-extractor` prefix and
+call `js-extractor` directly.
+
+> Only scan targets you own or are explicitly authorized to test. Good practice targets:
+> your own deployed app, a local lab (DVWA, Juice Shop, a Next.js/Vue app you built), or a
+> bug-bounty program whose scope permits it.
+
+### Step 1 — a first, quiet pass
+
+Start with plain extraction: pull and beautify the JS, nothing active.
+
+```bash
+docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example
+```
+
+Look in `./out/`: `external/` holds each downloaded script beautified, `inline/` holds the
+inline `<script>` blocks, and `results.json` summarizes the run. Open a file or two under
+`external/` to confirm you're getting real application code.
+
+### Step 2 — turn on the analysis
+
+Now ask it to actually analyze what it pulled:
+
+```bash
+docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+    --endpoints --params --secrets --dom --report
+```
+
+Then read the results (all written under `./out/`):
+
+| File | What to look for |
+|------|------------------|
+| `report.html` | Open in a browser — the human-friendly summary of everything below |
+| `endpoints.txt` / `endpoints_hidden.txt` | API paths the front end calls; "hidden" = admin/internal/debug tokens |
+| `params_wordlist.txt` | Parameter names that reach a request — feed these to a fuzzer |
+| `secrets.json` | Leaked keys/tokens with severity and exact `file:line` (unmasked — handle with care) |
+| `dom_sinks.json` | DOM-XSS sink/source flows to triage (then verify manually in a browser) |
+| `results.json` | Everything, machine-readable, for piping into other tools |
+
+### Step 3 — the full static pass
+
+`--all-analysis` turns on every static analyzer (endpoints, params, secrets, DOM, CVE,
+GraphQL, config, replay, source-intel) plus any external tools that are present:
+
+```bash
+docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+    --all-analysis --report
+```
+
+### Step 4 — make the findings actionable with `--replay`
+
+`--replay` turns the endpoint list into things you can run:
+
+```bash
+docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+    --endpoints --params --replay \
+    --cookie "session=YOUR_SESSION"        # if the app needs auth
+```
+
+- `out/openapi.json` — import into Postman/Insomnia or Swagger UI to browse the API.
+- `out/curl_commands.sh` — one ready-to-run `curl` per endpoint, already carrying your auth.
+- `out/ffuf_commands.sh` — parameter-fuzzing lines; run them with the `params_wordlist.txt`.
+
+### Step 5 — GraphQL and dependency confusion
+
+If the app speaks GraphQL, pull its operations and (with permission) probe the schema:
+
+```bash
+docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+    --graphql --graphql-introspect
+# → out/graphql.json (operations, fragments, endpoints) and, if introspection is open,
+#   out/graphql_schema.json
+```
+
+If source maps are available, mine the first-party code and check its packages against npm:
+
+```bash
+docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+    --source-intel --dep-confusion
+# → out/source_intel.json (packages, project tree, emails, TODOs)
+# → out/dep_confusion.json — any "claimable" package is a dependency-confusion candidate
+```
+
+### Step 6 — re-analyze files you already have (no network)
+
+Already downloaded the JS, or pulled an app bundle apart? Analyze it offline:
+
+```bash
+# put the .js files under ./out/js  →  they appear at /work/js in the container
+docker run --rm -v "$PWD/out:/work" js-extractor --input-dir /work/js --all-analysis --report
+```
+
+### Step 7 — scan many targets at once
+
+```bash
+# one URL per line in ./out/targets.txt  ('#' comments allowed)
+docker run --rm -v "$PWD/out:/work" js-extractor -l /work/targets.txt --endpoints --secrets
+# each target gets its own ./out/<host>_<hash>/ directory
+```
+
+### Step 8 — use it as a CI gate
+
+`--fail-on` makes the process exit non-zero when something is found, so a pipeline can block on it:
+
+```bash
+js-extractor https://staging.example.com --fail-on secrets,cves --json > results.json
+echo "exit code: $?"   # 0 = clean, 3 = a --fail-on category matched
+```
+
+**Exit codes:** `0` success · `1` target unreachable · `2` bad arguments · `3` a `--fail-on`
+category matched · `130` interrupted (Ctrl+C).
+
+### Need `--dynamic` or the crawler tools?
+
+The default image is static-only. For the headless browser (`--dynamic`) and external crawlers
+(`--katana`, `--gau`, `--httpx-probe`, `--retire`, `--semgrep`), build the full image once:
+
+```bash
+docker build -f Dockerfile.full -t js-extractor:full .
+docker run --rm -v "$PWD/out:/work" js-extractor:full https://your-target.example \
+    --all-analysis --dynamic --katana --gau --httpx-probe --retire --semgrep --report
 ```
 
 ---

@@ -1,0 +1,17 @@
+# Convenience wrapper. Build once, then pass CLI args after the service name:
+#
+#   docker compose build
+#   docker compose run --rm js-extractor https://example.com --all-analysis --report
+#   docker compose run --rm js-extractor -l /work/targets.txt --endpoints --json
+#
+# Everything under ./out on the host is where results are written (/work in the
+# container). Drop a targets.txt / input files in ./out to reach them as /work/*.
+services:
+  js-extractor:
+    build: .
+    image: js-extractor
+    volumes:
+      - ./out:/work
+    # Keep host output owned by you instead of root (comment out if it causes
+    # permission issues on your platform):
+    user: "${UID:-1000}:${GID:-1000}"
