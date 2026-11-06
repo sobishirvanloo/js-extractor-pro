@@ -12,11 +12,11 @@ from pathlib import Path
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(Path(_REPO).resolve()))
 
-from js_extractor import cli
-from js_extractor.analyzers.graphql import find_graphql_in_files, parse_introspection
-from js_extractor.analyzers.config import find_config_in_files
-from js_extractor.analyzers.replay import build_openapi, build_curl_commands, build_ffuf_commands
-from js_extractor.analyzers.sourceintel import find_source_intel, check_npm_packages
+from jxray import cli
+from jxray.analyzers.graphql import find_graphql_in_files, parse_introspection
+from jxray.analyzers.config import find_config_in_files
+from jxray.analyzers.replay import build_openapi, build_curl_commands, build_ffuf_commands
+from jxray.analyzers.sourceintel import find_source_intel, check_npm_packages
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-recon-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -97,7 +97,7 @@ calls = []
 def fake_get(url, timeout=None):
     calls.append(url)
     return _Resp(404 if "private-kit" in url else 200)   # scoped internal pkg is unpublished
-import js_extractor.analyzers.sourceintel as _si_mod
+import jxray.analyzers.sourceintel as _si_mod
 _si_mod.requests.get = fake_get
 _si_mod.time.sleep = lambda *_: None
 dep = check_npm_packages(["@acme/private-kit", "react"])

@@ -9,7 +9,7 @@ from pathlib import Path
 
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, _REPO)
-from js_extractor import cli
+from jxray import cli
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -60,7 +60,7 @@ srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 cli.lookup_cves = lambda libs, **kw: []   # no network calls to OSV in tests
-sys.argv = ["js-extractor", f"http://127.0.0.1:{srv.server_port}/",
+sys.argv = ["jxray", f"http://127.0.0.1:{srv.server_port}/",
             "--endpoints", "--params", "--secrets", "--cve", "--report",
             "--retire", "--semgrep", "--linkfinder", "--output-dir", str(OUT)]
 cli.main()

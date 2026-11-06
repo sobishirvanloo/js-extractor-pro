@@ -1,15 +1,15 @@
 # Convenience wrapper. Build once, then pass CLI args after the service name:
 #
 #   docker compose build
-#   docker compose run --rm js-extractor https://example.com --all-analysis --report
-#   docker compose run --rm js-extractor -l /work/targets.txt --endpoints --json
+#   docker compose run --rm jxray https://example.com --all-analysis --report
+#   docker compose run --rm jxray -l /work/targets.txt --endpoints --json
 #
 # Everything under ./out on the host is where results are written (/work in the
 # container). Drop a targets.txt / input files in ./out to reach them as /work/*.
 services:
-  js-extractor:
+  jxray:
     build: .
-    image: js-extractor
+    image: jxray
     volumes:
       - ./out:/work
     # Keep host output owned by you instead of root (comment out if it causes

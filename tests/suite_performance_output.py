@@ -11,7 +11,7 @@ from pathlib import Path
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 REPO = Path(_REPO).resolve()
 sys.path.insert(0, str(REPO))
-from js_extractor import cli
+from jxray import cli
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -75,7 +75,7 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{srv.server_port}"
 
 def run_main(argv):
-    sys.argv = ["js-extractor"] + argv
+    sys.argv = ["jxray"] + argv
     buf = io.StringIO(); code = 0
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
@@ -134,7 +134,7 @@ check(r["stats"]["external_downloaded"] == 3 and len(r["skipped"]["max_files"]) 
       f"--max-files 3: 3 downloaded, {len(r['skipped']['max_files'])} skipped")
 
 # ── --json on real stdout (subprocess) ───────────────────────────────────────
-p = subprocess.run([sys.executable, "-I", str(REPO / "js_extractor" / "cli.py"), BASE + "/secret",
+p = subprocess.run([sys.executable, "-I", str(REPO / "jxray" / "cli.py"), BASE + "/secret",
                     "--json", "--secrets", "--rate-limit", "0", "--no-sourcemaps",
                     "--output-dir", str(TMP / "j1")], capture_output=True, text=True, timeout=120)
 try:
@@ -147,7 +147,7 @@ check(doc.get("secrets") and doc["secrets"][0]["value"] == "AKIASTAGETHREETEST01
       and doc["stats"]["findings"]["secrets"] == 1, "--json: findings + stats present")
 check(json.loads((TMP / "j1" / "results.json").read_text()) == doc, "--json output == results.json")
 
-p = subprocess.run([sys.executable, "-I", str(REPO / "js_extractor" / "cli.py"), "http://127.0.0.1:1/",
+p = subprocess.run([sys.executable, "-I", str(REPO / "jxray" / "cli.py"), "http://127.0.0.1:1/",
                     "--json", "--output-dir", str(TMP / "j2")], capture_output=True, text=True, timeout=120)
 check(p.returncode == 1 and "error" in json.loads(p.stdout or "{}"), "--json: unreachable target → JSON error doc, exit 1")
 

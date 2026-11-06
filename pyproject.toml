@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "js-extractor"
+name = "jxray"
 dynamic = ["version"]
 description = "Extract, beautify, and analyze all JavaScript from a web page (recon/pentest tool)."
 readme = "README.md"
@@ -29,13 +29,13 @@ full = ["playwright>=1.40.0"]
 dev = ["pytest>=7.0"]
 
 [project.scripts]
-js-extractor = "js_extractor.cli:main"
+jxray = "jxray.cli:main"
 
 [tool.setuptools.dynamic]
-version = { attr = "js_extractor.__version__" }
+version = { attr = "jxray.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["js_extractor*"]
+include = ["jxray*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

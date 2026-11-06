@@ -26,7 +26,7 @@ WAYBACK_RATE = 1.0                           # req/s — archive.org is a shared
 def make_wayback_session(max_bytes: int = 0) -> requests.Session:
     """Plain session for archive.org: no target credentials, no target scope, no --proxy."""
     s = requests.Session()
-    s.headers.update({"User-Agent": "js-extractor (+https://github.com/sobishirvanloo/js-extractor-pro)"})
+    s.headers.update({"User-Agent": "jxray (+https://github.com/sobishirvanloo/js-extractor-pro)"})
     s.limiter = RateLimiter(WAYBACK_RATE)
     s.max_bytes = max_bytes
     s.scope = None

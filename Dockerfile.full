@@ -6,8 +6,8 @@
 # only when you need --dynamic / --katana / --gau / --httpx-probe / --retire /
 # --semgrep without installing anything on the host.
 #
-#   docker build -f Dockerfile.full -t js-extractor:full .
-#   docker run --rm -v "$PWD/out:/work" js-extractor:full https://example.com \
+#   docker build -f Dockerfile.full -t jxray:full .
+#   docker run --rm -v "$PWD/out:/work" jxray:full https://example.com \
 #       --all-analysis --dynamic --katana --gau --httpx-probe --retire --semgrep --report
 
 # ── Stage 1: compile the Go tools, keep the toolchain out of the final image ──
@@ -21,8 +21,8 @@ RUN mkdir -p /out \
 # ── Stage 2: runtime ──────────────────────────────────────────────────────────
 FROM python:3.12-slim
 
-LABEL org.opencontainers.image.title="js-extractor-pro (full)" \
-      org.opencontainers.image.description="js-extractor with headless browser and external recon tools bundled." \
+LABEL org.opencontainers.image.title="jxray (full)" \
+      org.opencontainers.image.description="jxray with headless browser and external recon tools bundled." \
       org.opencontainers.image.licenses="MIT"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -42,12 +42,12 @@ COPY --from=gobuild /out/ /usr/local/bin/
 
 WORKDIR /src
 COPY pyproject.toml README.md ./
-COPY js_extractor ./js_extractor
+COPY jxray ./jxray
 # Package + semgrep + Playwright, then the Chromium build and its OS libraries.
 RUN pip install . semgrep playwright \
     && playwright install --with-deps chromium \
     && mkdir -p /work && chmod 777 /work
 
 WORKDIR /work
-ENTRYPOINT ["js-extractor"]
+ENTRYPOINT ["jxray"]
 CMD ["--help"]

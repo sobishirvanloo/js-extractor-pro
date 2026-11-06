@@ -9,7 +9,7 @@ from pathlib import Path
 
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, _REPO)
-from js_extractor import cli
+from jxray import cli
 
 LOG = {"target": [], "third": []}
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
@@ -65,7 +65,7 @@ for s in (third, target):
 TARGET = f"http://127.0.0.1:{target.server_port}/"
 
 
-sys.argv = ["js-extractor", TARGET, "--cookie", "session=SECRETCOOKIE",
+sys.argv = ["jxray", TARGET, "--cookie", "session=SECRETCOOKIE",
             "--jwt", "SECRETJWT", "--header", "X-Api-Key: SECRETKEY",
             "--endpoints", "--params", "--report", "--output-dir", str(OUT)]
 cli.main()

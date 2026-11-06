@@ -10,9 +10,9 @@ from pathlib import Path
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(Path(_REPO).resolve()))
 
-from js_extractor import cli
-from js_extractor.analyzers import versions
-from js_extractor.output import beautify, light_prettify
+from jxray import cli
+from jxray.analyzers import versions
+from jxray.output import beautify, light_prettify
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-vtest-"))
 atexit.register(shutil.rmtree, TMP, True)

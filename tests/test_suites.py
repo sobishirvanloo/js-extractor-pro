@@ -3,7 +3,7 @@ Run every tests/suite_*.py in its own Python process.
 
 The suites are end-to-end: they start local HTTP(S) servers and fake
 external tools, then run the real CLI against them. Several of them patch
-module globals in js_extractor.cli (Playwright, OSV lookups, PATH), so each
+module globals in jxray.cli (Playwright, OSV lookups, PATH), so each
 one gets a fresh interpreter instead of sharing pytest's.
 
     pytest                         # all suites

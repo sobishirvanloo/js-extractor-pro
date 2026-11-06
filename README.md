@@ -1,7 +1,7 @@
-# JS Extractor & Beautifier (v2)
+# jxray — deep JavaScript recon
 
-Extracts, beautifies, and analyzes **all** JavaScript from a web page — built for recon and
-front-end-heavy web application penetration testing.
+**jxray** x-rays a web app's JavaScript: it extracts, beautifies, and analyzes **all** of it —
+built for recon and front-end-heavy web application penetration testing.
 
 It pulls inline `<script>` blocks, external `.js` files, Web Worker / Service Worker code, lazy
 webpack/Vite/Next.js chunks, source-map originals, and (optionally) code discovered via a headless
@@ -45,10 +45,10 @@ The fastest path, with nothing to install but Docker:
 ```bash
 git clone https://github.com/sobishirvanloo/js-extractor-pro.git
 cd js-extractor-pro
-docker build -t js-extractor .
+docker build -t jxray .
 
 # scan a target you're allowed to test; results land in ./out on your machine
-docker run --rm -v "$PWD/out:/work" js-extractor https://example.com --all-analysis --report
+docker run --rm -v "$PWD/out:/work" jxray https://example.com --all-analysis --report
 open out/report.html     # macOS; use xdg-open on Linux, start on Windows
 ```
 
@@ -56,7 +56,7 @@ Prefer Python? With Python 3.9+:
 
 ```bash
 pip install .
-js-extractor https://example.com --all-analysis --report --output-dir ./out
+jxray https://example.com --all-analysis --report --output-dir ./out
 ```
 
 New here? Jump to the [step-by-step tutorial](#tutorial--your-first-scan-step-by-step).
@@ -99,7 +99,7 @@ New here? Jump to the [step-by-step tutorial](#tutorial--your-first-scan-step-by
   **medium** (generic `apiKey`/`secret`/`password` values, after entropy and placeholder filtering),
   **low** (public by design: Google browser keys, Stripe/Mapbox publishable keys, Sentry DSNs). JWTs are
   decoded: a Supabase `service_role` key is high, an `anon` key low. `--fail-on secrets` ignores low.
-- **DOM XSS taint analysis** — `--dom` (`js_extractor/dom.py`): a static map of where untrusted data
+- **DOM XSS taint analysis** — `--dom` (`jxray/dom.py`): a static map of where untrusted data
   can reach a dangerous sink, for triage and for driving manual testing (e.g. DOM Invader). Not proof
   of exploitability.
   - **Sources**: `location.*`, `document.URL`/`referrer`/`cookie`, `window.name`, `URLSearchParams(location)`,
@@ -177,11 +177,11 @@ install them interactively, or install each one manually with the commands in th
 
 ### Option 1 — Install as a CLI tool (recommended)
 
-Clone the repo and install with pip. This registers a `js-extractor` command on your `PATH`.
+Clone the repo and install with pip. This registers a `jxray` command on your `PATH`.
 
 ```bash
-git clone https://github.com/sobishirvanloo/js_extractor.git
-cd js_extractor
+git clone https://github.com/sobishirvanloo/jxray.git
+cd jxray
 pip install .
 ```
 
@@ -195,8 +195,8 @@ playwright install chromium
 ### Option 2 — One-line installer script
 
 ```bash
-git clone https://github.com/sobishirvanloo/js_extractor.git
-cd js_extractor
+git clone https://github.com/sobishirvanloo/jxray.git
+cd jxray
 chmod +x install.sh
 ./install.sh
 ```
@@ -209,10 +209,10 @@ installed without you confirming it.
 ### Option 3 — Run without installing
 
 ```bash
-git clone https://github.com/sobishirvanloo/js_extractor.git
-cd js_extractor
+git clone https://github.com/sobishirvanloo/jxray.git
+cd jxray
 pip install -r requirements.txt
-python3 js_extractor/cli.py <url> [options]
+python3 jxray/cli.py <url> [options]
 ```
 
 ### Editable / development install
@@ -227,24 +227,24 @@ Everything the core needs is baked into the image, so it runs the same on
 Linux, macOS and Windows with nothing to install on the host but Docker.
 
 ```bash
-docker build -t js-extractor .
+docker build -t jxray .
 
 # scan a URL; results land in ./out on the host (mounted at /work)
-docker run --rm -v "$PWD/out:/work" js-extractor https://example.com \
+docker run --rm -v "$PWD/out:/work" jxray https://example.com \
     --all-analysis --report
 
 # keep output files owned by you instead of root
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/out:/work" \
-    js-extractor https://example.com --endpoints --json
+    jxray https://example.com --endpoints --json
 
 # analyze local files you drop into ./out  →  /work inside the container
-docker run --rm -v "$PWD/out:/work" js-extractor --input-dir /work/js --all-analysis
+docker run --rm -v "$PWD/out:/work" jxray --input-dir /work/js --all-analysis
 ```
 
 Or with Compose:
 
 ```bash
-docker compose run --rm js-extractor https://example.com --all-analysis --report
+docker compose run --rm jxray https://example.com --all-analysis --report
 ```
 
 The default image includes **all static and network analysis** (endpoints,
@@ -254,8 +254,8 @@ dependency-confusion, wayback). It does **not** include the headless browser
 — for those, build the larger optional image:
 
 ```bash
-docker build -f Dockerfile.full -t js-extractor:full .
-docker run --rm -v "$PWD/out:/work" js-extractor:full https://example.com \
+docker build -f Dockerfile.full -t jxray:full .
+docker run --rm -v "$PWD/out:/work" jxray:full https://example.com \
     --all-analysis --dynamic --katana --gau --httpx-probe --retire --semgrep --report
 ```
 
@@ -263,16 +263,16 @@ docker run --rm -v "$PWD/out:/work" js-extractor:full https://example.com \
 
 ## Usage
 
-Once installed, the `js-extractor` command is available globally:
+Once installed, the `jxray` command is available globally:
 
 ```bash
-js-extractor <url> [options]
+jxray <url> [options]
 ```
 
 Or, without installing:
 
 ```bash
-python3 js_extractor/cli.py <url> [options]
+python3 jxray/cli.py <url> [options]
 ```
 
 ### Targets: one URL, a list, or local files
@@ -280,9 +280,9 @@ python3 js_extractor/cli.py <url> [options]
 Give exactly one of these:
 
 ```bash
-js-extractor https://example.com [options]        # a single URL
-js-extractor -l targets.txt [options]             # one URL per line ('#' comments ok; '-' = stdin)
-js-extractor --input-dir ./some_js_dir [options]  # analyze .js already on disk, no network
+jxray https://example.com [options]        # a single URL
+jxray -l targets.txt [options]             # one URL per line ('#' comments ok; '-' = stdin)
+jxray --input-dir ./some_js_dir [options]  # analyze .js already on disk, no network
 ```
 
 - **`-l, --list FILE`** — batch mode. Every URL is scanned into its own sub-directory under
@@ -410,10 +410,10 @@ produces `X`.
 
 ```bash
 # CI gate: fail the build if the deployed JS leaks a secret
-js-extractor https://staging.example.com --fail-on secrets --json > js-results.json
+jxray https://staging.example.com --fail-on secrets --json > js-results.json
 
 # pipe endpoints into other tools
-js-extractor https://example.com --endpoints --json | jq -r '.endpoints[]' | sort -u
+jxray https://example.com --endpoints --json | jq -r '.endpoints[]' | sort -u
 ```
 
 ### Examples
@@ -421,7 +421,7 @@ js-extractor https://example.com --endpoints --json | jq -r '.endpoints[]' | sor
 Through Burp, staying strictly on the target's domain:
 
 ```bash
-js-extractor https://app.target.com \
+jxray https://app.target.com \
   --proxy http://127.0.0.1:8080 --ca-cert burp.pem \
   --scope domain --exclude-host "*.google-analytics.com" \
   --cookie "session=abc123" --auth-scope domain \
@@ -431,13 +431,13 @@ js-extractor https://app.target.com \
 Basic static extraction:
 
 ```bash
-js-extractor https://target.com
+jxray https://target.com
 ```
 
 Full recon pass — dynamic extraction, deep crawl, historical URLs (alive-checked), all analysis, HTML report:
 
 ```bash
-js-extractor https://target.com \
+jxray https://target.com \
   --dynamic --katana --gau --httpx-probe --all-analysis --merge --report \
   --output-dir ./target_js
 ```
@@ -445,13 +445,13 @@ js-extractor https://target.com \
 Historical JS only, without probing (faster, noisier):
 
 ```bash
-js-extractor https://target.com --gau --gau-providers wayback,otx
+jxray https://target.com --gau --gau-providers wayback,otx
 ```
 
 Authenticated scan behind a login:
 
 ```bash
-js-extractor https://target.com/dashboard \
+jxray https://target.com/dashboard \
   --cookie "session=abc123" \
   --header "X-Custom-Header: value" \
   --endpoints --secrets --cve
@@ -462,9 +462,9 @@ js-extractor https://target.com/dashboard \
 ## Tutorial — your first scan, step by step
 
 This walkthrough takes you from zero to a full recon pass and shows you how to read
-every artefact. It assumes the Docker image is built (`docker build -t js-extractor .`);
-if you installed with pip instead, just drop the `docker run ... js-extractor` prefix and
-call `js-extractor` directly.
+every artefact. It assumes the Docker image is built (`docker build -t jxray .`);
+if you installed with pip instead, just drop the `docker run ... jxray` prefix and
+call `jxray` directly.
 
 > Only scan targets you own or are explicitly authorized to test. Good practice targets:
 > your own deployed app, a local lab (DVWA, Juice Shop, a Next.js/Vue app you built), or a
@@ -475,7 +475,7 @@ call `js-extractor` directly.
 Start with plain extraction: pull and beautify the JS, nothing active.
 
 ```bash
-docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example
+docker run --rm -v "$PWD/out:/work" jxray https://your-target.example
 ```
 
 Look in `./out/`: `external/` holds each downloaded script beautified, `inline/` holds the
@@ -487,7 +487,7 @@ inline `<script>` blocks, and `results.json` summarizes the run. Open a file or 
 Now ask it to actually analyze what it pulled:
 
 ```bash
-docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+docker run --rm -v "$PWD/out:/work" jxray https://your-target.example \
     --endpoints --params --secrets --dom --report
 ```
 
@@ -508,7 +508,7 @@ Then read the results (all written under `./out/`):
 GraphQL, config, replay, source-intel) plus any external tools that are present:
 
 ```bash
-docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+docker run --rm -v "$PWD/out:/work" jxray https://your-target.example \
     --all-analysis --report
 ```
 
@@ -517,7 +517,7 @@ docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
 `--replay` turns the endpoint list into things you can run:
 
 ```bash
-docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+docker run --rm -v "$PWD/out:/work" jxray https://your-target.example \
     --endpoints --params --replay \
     --cookie "session=YOUR_SESSION"        # if the app needs auth
 ```
@@ -531,7 +531,7 @@ docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
 If the app speaks GraphQL, pull its operations and (with permission) probe the schema:
 
 ```bash
-docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+docker run --rm -v "$PWD/out:/work" jxray https://your-target.example \
     --graphql --graphql-introspect
 # → out/graphql.json (operations, fragments, endpoints) and, if introspection is open,
 #   out/graphql_schema.json
@@ -540,7 +540,7 @@ docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
 If source maps are available, mine the first-party code and check its packages against npm:
 
 ```bash
-docker run --rm -v "$PWD/out:/work" js-extractor https://your-target.example \
+docker run --rm -v "$PWD/out:/work" jxray https://your-target.example \
     --source-intel --dep-confusion
 # → out/source_intel.json (packages, project tree, emails, TODOs)
 # → out/dep_confusion.json — any "claimable" package is a dependency-confusion candidate
@@ -552,14 +552,14 @@ Already downloaded the JS, or pulled an app bundle apart? Analyze it offline:
 
 ```bash
 # put the .js files under ./out/js  →  they appear at /work/js in the container
-docker run --rm -v "$PWD/out:/work" js-extractor --input-dir /work/js --all-analysis --report
+docker run --rm -v "$PWD/out:/work" jxray --input-dir /work/js --all-analysis --report
 ```
 
 ### Step 7 — scan many targets at once
 
 ```bash
 # one URL per line in ./out/targets.txt  ('#' comments allowed)
-docker run --rm -v "$PWD/out:/work" js-extractor -l /work/targets.txt --endpoints --secrets
+docker run --rm -v "$PWD/out:/work" jxray -l /work/targets.txt --endpoints --secrets
 # each target gets its own ./out/<host>_<hash>/ directory
 ```
 
@@ -568,7 +568,7 @@ docker run --rm -v "$PWD/out:/work" js-extractor -l /work/targets.txt --endpoint
 `--fail-on` makes the process exit non-zero when something is found, so a pipeline can block on it:
 
 ```bash
-js-extractor https://staging.example.com --fail-on secrets,cves --json > results.json
+jxray https://staging.example.com --fail-on secrets,cves --json > results.json
 echo "exit code: $?"   # 0 = clean, 3 = a --fail-on category matched
 ```
 
@@ -581,8 +581,8 @@ The default image is static-only. For the headless browser (`--dynamic`) and ext
 (`--katana`, `--gau`, `--httpx-probe`, `--retire`, `--semgrep`), build the full image once:
 
 ```bash
-docker build -f Dockerfile.full -t js-extractor:full .
-docker run --rm -v "$PWD/out:/work" js-extractor:full https://your-target.example \
+docker build -f Dockerfile.full -t jxray:full .
+docker run --rm -v "$PWD/out:/work" jxray:full https://your-target.example \
     --all-analysis --dynamic --katana --gau --httpx-probe --retire --semgrep --report
 ```
 
@@ -629,7 +629,7 @@ js_output/
 ## Project layout
 
 ```
-js_extractor/
+jxray/
 ├── cli.py               # arguments + orchestration (main / _run); re-exports the public API
 ├── net.py               # fetch(), Scope, ScopedAuth, RateLimiter, sessions, proxy/TLS
 ├── ui.py · output.py    # colours · beautify, save_js, results.json

@@ -24,10 +24,10 @@ Features:
   - HTML report generation
 
 Usage:
-  js-extractor <url> [options]              (installed console script)
-  python3 -m js_extractor.cli <url> [options]
-  python3 -m js_extractor.cli -l targets.txt [options]        (batch)
-  python3 -m js_extractor.cli --input-dir ./js [options]      (local, no network)
+  jxray <url> [options]              (installed console script)
+  python3 -m jxray.cli <url> [options]
+  python3 -m jxray.cli -l targets.txt [options]        (batch)
+  python3 -m jxray.cli --input-dir ./js [options]      (local, no network)
 
 Auth:
   --cookie "name=value; name2=value2"
@@ -84,29 +84,29 @@ from urllib.parse import urljoin, urlparse
 import requests  # noqa: F401  (re-exported: tests and library users use cli.requests)
 
 # The package modules are imported absolutely so this file also works when run
-# directly (`python js_extractor/cli.py`), where relative imports are unavailable.
+# directly (`python jxray/cli.py`), where relative imports are unavailable.
 # Names not used here are re-exported for library users and the test suites.
 try:
-    import js_extractor  # noqa: F401
+    import jxray  # noqa: F401
 except ImportError:                       # run directly as a script
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from js_extractor.analyzers.dom import find_dom_issues, find_dom_issues_in_files, find_dom_sources
-from js_extractor.analyzers.endpoints import (
+from jxray.analyzers.dom import find_dom_issues, find_dom_issues_in_files, find_dom_sources
+from jxray.analyzers.endpoints import (
     extract_endpoints,
     find_endpoints,
     find_endpoints_in_files,
     is_hidden_endpoint,
 )
-from js_extractor.analyzers.frameworks import detect_frameworks
-from js_extractor.analyzers.params import extract_params
-from js_extractor.analyzers.secrets import find_secrets, find_secrets_in_files, mask_secret
-from js_extractor.analyzers.versions import detect_library_versions, lookup_cves
-from js_extractor.analyzers.graphql import find_graphql_in_files, INTROSPECTION_QUERY, parse_introspection
-from js_extractor.analyzers.config import find_config_in_files
-from js_extractor.analyzers.replay import build_openapi, build_curl_commands, build_ffuf_commands
-from js_extractor.analyzers.sourceintel import find_source_intel, check_npm_packages
-from js_extractor.discovery.chunks import (
+from jxray.analyzers.frameworks import detect_frameworks
+from jxray.analyzers.params import extract_params
+from jxray.analyzers.secrets import find_secrets, find_secrets_in_files, mask_secret
+from jxray.analyzers.versions import detect_library_versions, lookup_cves
+from jxray.analyzers.graphql import find_graphql_in_files, INTROSPECTION_QUERY, parse_introspection
+from jxray.analyzers.config import find_config_in_files
+from jxray.analyzers.replay import build_openapi, build_curl_commands, build_ffuf_commands
+from jxray.analyzers.sourceintel import find_source_intel, check_npm_packages
+from jxray.discovery.chunks import (
     find_asset_paths,
     find_chunk_ids,
     find_chunk_templates,
@@ -114,10 +114,10 @@ from js_extractor.discovery.chunks import (
     parse_next_build_manifest,
     parse_vite_manifest,
 )
-from js_extractor.discovery.dynamic import extract_dynamic
-from js_extractor.discovery.html import extract_from_html
-from js_extractor.discovery.imports import find_js_imports, find_workers
-from js_extractor.discovery.sourcemaps import (
+from jxray.discovery.dynamic import extract_dynamic
+from jxray.discovery.html import extract_from_html
+from jxray.discovery.imports import find_js_imports, find_workers
+from jxray.discovery.sourcemaps import (
     analysis_dirs,
     find_sourcemap_ref,
     is_vendor_path,
@@ -126,13 +126,13 @@ from js_extractor.discovery.sourcemaps import (
     safe_sourcemap_dest,
     try_recover_sourcemap,
 )
-from js_extractor.discovery.wayback import (
+from jxray.discovery.wayback import (
     fetch_from_wayback,
     make_wayback_session,
     wayback_latest_snapshot,
     wayback_url,
 )
-from js_extractor.integrations.tools import (
+from jxray.integrations.tools import (
     _is_js_url,
     run_gau,
     run_httpx_probe,
@@ -143,7 +143,7 @@ from js_extractor.integrations.tools import (
     run_semgrep,
     run_wappalyzer,
 )
-from js_extractor.net import (
+from jxray.net import (
     RateLimiter,
     Scope,
     ScopedAuth,
@@ -155,12 +155,12 @@ from js_extractor.net import (
     make_session,
     safe_filename,
 )
-from js_extractor.output import beautify, save_js, write_results
-from js_extractor.report import generate_report
-from js_extractor.ui import bold, cyan, green, red, yellow
+from jxray.output import beautify, save_js, write_results
+from jxray.report import generate_report
+from jxray.ui import bold, cyan, green, red, yellow
 
 try:
-    from js_extractor import __version__
+    from jxray import __version__
 except ImportError:                       # run directly as a script
     __version__ = "unknown"
 
@@ -509,7 +509,7 @@ def _run(args, parser, fail_on: list, json_stream) -> int:
     resp = fetch(args.url, session)
     if not resp:
         write_results(output_dir / "results.json", {
-            "tool": "js-extractor", "version": __version__, "target": args.url,
+            "tool": "jxray", "version": __version__, "target": args.url,
             "error": f"could not fetch target ({session.fetch_error or 'error'})",
         }, json_stream)
         return 1
@@ -1340,7 +1340,7 @@ def _analyze_and_report(args, fail_on: list, json_stream, ctx: dict) -> int:
         "dep-confusion": sum(1 for d in report_data.get("dep_confusion", []) if d["status"] == "claimable"),
     }
     results = {
-        "tool": "js-extractor",
+        "tool": "jxray",
         "version": __version__,
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "target": target,

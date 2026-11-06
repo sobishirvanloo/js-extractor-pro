@@ -10,8 +10,8 @@ from pathlib import Path
 
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, _REPO)
-from js_extractor import cli
-from js_extractor.discovery import dynamic  # globals patched below live in this module
+from jxray import cli
+from jxray.discovery import dynamic  # globals patched below live in this module
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -142,7 +142,7 @@ class H(BaseHTTPRequestHandler):
 srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 OUT = TMP / "out"
-sys.argv = ["js-extractor", f"http://127.0.0.1:{srv.server_port}/", "--secrets", "--report",
+sys.argv = ["jxray", f"http://127.0.0.1:{srv.server_port}/", "--secrets", "--report",
             "--output-dir", str(OUT)]
 cli.main()
 

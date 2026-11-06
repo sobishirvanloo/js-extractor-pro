@@ -68,7 +68,7 @@ def build_openapi(endpoint_details: list[dict], params: list[str], base_url: str
     doc = {
         "openapi": "3.0.3",
         "info": {"title": title, "version": "0.0.0",
-                 "description": "Statically reconstructed from client JS by js-extractor. "
+                 "description": "Statically reconstructed from client JS by jxray. "
                                 "Unverified: endpoints/methods are inferred, not confirmed."},
         "servers": [{"url": s} for s in servers],
         "paths": paths,

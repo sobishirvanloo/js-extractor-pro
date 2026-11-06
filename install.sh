@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Quick installer for js-extractor + optional external recon tools
+# Quick installer for jxray + optional external recon tools
 set -e
 
-echo "[*] Installing js-extractor..."
+echo "[*] Installing jxray..."
 
 if ! command -v python3 &>/dev/null; then
     echo "[!] python3 not found. Install Python 3.9+ first." >&2
@@ -20,13 +20,13 @@ if [[ "$ans" =~ ^[Yy]$ ]]; then
 fi
 
 echo ""
-echo "[+] Core package installed. Run with: js-extractor <url> [options]"
+echo "[+] Core package installed. Run with: jxray <url> [options]"
 
 # ──────────────────────────────────────────────────────────────────────────
 # Optional external tools
 # ──────────────────────────────────────────────────────────────────────────
 # These are NOT Python packages — they're separate Go/Node/Python CLI
-# binaries that the corresponding flags shell out to. js-extractor detects
+# binaries that the corresponding flags shell out to. jxray detects
 # them at runtime (shutil.which) and skips that analysis step with a
 # warning if missing — it never installs them silently on its own, since
 # that would mean quietly running `go install` / `npm install -g` /
@@ -125,7 +125,7 @@ if [[ "$install_tools" =~ ^[Yy]$ ]]; then
 fi
 
 echo ""
-echo "[+] Done. Run with: js-extractor <url> [options]"
+echo "[+] Done. Run with: jxray <url> [options]"
 echo "[+] Re-run this script anytime to install more optional tools, or install them manually:"
 echo "      katana      -> go install github.com/projectdiscovery/katana/cmd/katana@latest"
 echo "      gau         -> go install github.com/lc/gau/v2/cmd/gau@latest"

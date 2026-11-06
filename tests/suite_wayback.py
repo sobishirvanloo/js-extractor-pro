@@ -15,8 +15,8 @@ from urllib.parse import urlsplit, parse_qs, unquote
 
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(Path(_REPO).resolve()))
-from js_extractor import cli
-from js_extractor.discovery import wayback  # globals patched below live in this module
+from jxray import cli
+from jxray.discovery import wayback  # globals patched below live in this module
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -94,7 +94,7 @@ wayback.WAYBACK_BASE = WAYBACK
 wayback.WAYBACK_RATE = 0          # no throttling against the local stand-in
 
 def run_main(argv):
-    sys.argv = ["js-extractor"] + argv
+    sys.argv = ["jxray"] + argv
     buf = io.StringIO(); code = 0
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:

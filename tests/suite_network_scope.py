@@ -10,8 +10,8 @@ from urllib.parse import urlsplit
 
 _REPO = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[1])
 sys.path.insert(0, _REPO)
-from js_extractor import cli
-from js_extractor.discovery import dynamic  # globals patched below live in this module
+from jxray import cli
+from jxray.discovery import dynamic  # globals patched below live in this module
 
 TMP = Path(tempfile.mkdtemp(prefix="jsx-test-"))
 atexit.register(shutil.rmtree, TMP, True)
@@ -22,7 +22,7 @@ def check(cond, msg):
 
 def run_main(argv):
     """Run cli.main(); return (exit_code, stdout+stderr)."""
-    sys.argv = ["js-extractor"] + argv
+    sys.argv = ["jxray"] + argv
     buf = io.StringIO()
     code = 0
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
